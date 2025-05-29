@@ -1,0 +1,59 @@
+bot_token: "替换为你的机器人token"
+admin_id: 替换为你的管理员ID
+webhook_url: "替换为你的webhook网址"
+webhook_port: 8443
+secret_token: ""
+database:
+  database: ""  # 改为 database
+  user: ""
+  password: ""
+  host: ""
+  port: 5432
+pool_min: 1
+pool_max: 10
+chat_timeout: 300
+verification_timeout: 180
+log_file: "bot.log"  
+
+
+message_templates:
+  logging_configured: "日志配置完成"
+  config_loaded: "配置加载完成"
+  config_failed: "配置加载失败: {error}"
+  db_initialized: "数据库初始化完成"
+  db_timeout: "数据库初始化超时"
+  db_failed: "数据库初始化失败: {error}"
+  app_initialized: "Telegram 应用初始化完成"
+  commands_set: "机器人命令设置完成"
+  webhook_started: "Webhook 启动成功，端口: {port}"
+  webhook_timeout: "Webhook 启动尝试 {attempt}/3 超时"
+  webhook_failed: "Webhook 启动尝试 {attempt}/3 失败: {error}"
+  webhook_failed_final: "Webhook 启动失败，重试次数耗尽"
+  shutdown_initiated: "开始关闭程序"
+  updater_stopped: "Updater 已停止"
+  app_shutdown: "应用已关闭"
+  db_closed: "数据库连接已关闭"
+  shutdown_timeout: "关闭程序超时"
+  shutdown_failed: "关闭程序失败: {error}"
+  program_terminated: "程序被用户终止"
+  fatal_error: "致命错误: {error}"
+  telegram_error_generic: "发生错误，请联系管理员"
+  telegram_error_forbidden: "无法发送消息，您可能已屏蔽机器人"
+  telegram_error_bad_request: "操作失败，请稍后重试"
+  telegram_user_blocked: "您已被管理员拉黑"
+  telegram_user_not_found: "用户不存在"
+  telegram_user_already_blocked: "用户已被拉黑"
+  telegram_user_not_blocked: "用户未被拉黑"
+  telegram_user_not_verified: "无法切换：用户未验证"
+  telegram_verification_timeout: "验证超时，剩余{remaining}次机会\n{question}\n请从以下选项选择正确答案（保留2位小数），需在{timeout}分钟内完成"
+  telegram_verification_failed: "验证失败三次，您已被拉黑，请联系管理员"
+  telegram_verification_success: "验证成功！第{attempts}次尝试通过"
+  telegram_verification_error: "答案错误，剩余{remaining}次机会\n{question}\n请从以下选项选择正确答案（保留2位小数），需在{timeout}分钟内完成"
+  telegram_verification_start: "请完成验证\n{question}\n请从以下选项选择正确答案（保留2位小数），需在{timeout}分钟内完成"
+  telegram_ban_success: "用户 {user_id} 已拉黑"
+  telegram_unban_success: "用户 {user_id} 已解除拉黑"
+  telegram_list_users_empty: "暂无最近验证用户"
+  telegram_blacklist_empty: "黑名单为空"
+  telegram_clean_success: "数据库已清空"
+  telegram_admin_only: "仅限管理员操作"
+  telegram_invalid_command: "无效命令格式"
