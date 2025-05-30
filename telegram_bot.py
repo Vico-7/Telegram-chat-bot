@@ -1276,6 +1276,7 @@ class TelegramBot:
             return
         try:
             users = await self.db.get_verified_users()
+            users = users[:3]  # 限制为最近三位用户
             await self._send_user_list(update, users, is_blacklist=False, is_button=is_button)
             logger.info(f"List users command completed for user {update.effective_user.id}")
         except AttributeError as e:
