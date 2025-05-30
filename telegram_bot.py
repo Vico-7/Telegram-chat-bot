@@ -104,28 +104,21 @@ class VerificationHandler:
                         admin_id)
                     if not target_user_id:
                         try:
-                            # 构造伪 Update 对象，模拟管理员操作
-                            from telegram import User, Chat, Message
-                            admin_user = User(id=admin_id, first_name="", is_bot=False)
-                            admin_chat = Chat(id=admin_id, type="private")
-                            admin_message = Message(
-                                message_id=0,  # 伪消息 ID
-                                date=datetime.datetime.now(),
-                                chat=admin_chat,
-                                from_user=admin_user
-                            )
-                            admin_update = Update(
-                                update_id=update.update_id + 1,  # 避免重复 ID
-                                message=admin_message,
-                                callback_query=None
-                            )
-                            await self.bot.forward_handler.switch_chat(
-                                update=admin_update,
-                                context=context,
-                                user_id=user_id,
-                                is_button=False
-                            )
-                            logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
+                            # 直接调用 switch_chat 的核心逻辑，避免伪 Update
+                            user_info = await self.db.get_user_info(user_id)
+                            if user_info and not user_info.is_blocked and await self.db.is_verified(user_id):
+                                self.bot.forward_handler.current_chats[admin_id] = user_id
+                                await self.bot.forward_handler.reset_timer(admin_id, Config.CHAT_TIMEOUT,
+                                                                           self.bot.forward_handler.reset_chat)
+                                escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
+                                await self.bot.application.bot.send_message(
+                                    chat_id=admin_id,
+                                    text=f"已将对话目标切换为“[{escaped_nickname}](tg://user?id={user_id})”",
+                                    parse_mode="MarkdownV2"
+                                )
+                                logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
+                            else:
+                                logger.warning(f"Auto-switch failed: invalid user {user_id} (blocked or not verified)")
                         except Exception as e:
                             logger.error(f"Failed to auto-switch admin {admin_id} chat to user {user_id}: {str(e)}",
                                          exc_info=True)

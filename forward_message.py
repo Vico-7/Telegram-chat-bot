@@ -1,489 +1,267 @@
-import asyncpg
-from typing import Optional, List, Dict, Tuple, Any
-from dataclasses import dataclass
-import datetime
-import pytz
-from contextlib import asynccontextmanager
-from config import Config
-from logger import logger
+from typing import Dict, Optional, Tuple, Callable
 import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from logger import logger
+from database import Database, UserInfo
+from config import Config
+from telegram.error import Forbidden
 
-BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+class ForwardMessageHandler:
+    def __init__(self, db: Database, application):
+        self.db = db
+        self.application = application
+        self.current_chats: Dict[int, int] = {}
+        self.chat_timers: Dict[int, asyncio.TimerHandle] = {}
+        self.escape_markdown_v2: Optional[Callable[[str], str]] = None
+        logger.debug("ForwardMessageHandler initialized")
 
-# 消息模板（保持不变）
-MESSAGE_TEMPLATES = {
-    "db_initialized": "数据库初始化完成",
-    "db_already_initialized": "数据库连接池已初始化，关闭现有连接池",
-    "db_connection_failed": "数据库连接失败: {error}",
-    "db_init_failed": "数据库初始化失败: {error}",
-    "db_closed": "数据库连接池已关闭",
-    "db_schema_updated": "验证表 schema 更新完成",
-    "db_schema_update_failed": "验证表 schema 更新失败: {error}",
-    "db_query_failed": "数据库查询失败: {error}",
-    "db_unexpected_error": "数据库意外错误: {error}",
-    "db_not_initialized": "数据库连接池未初始化",
-    "db_cleared": "数据库已清空",
-    "invalid_user_data": "无效的用户 ID 或昵称",
-    "invalid_block_data": "无效的用户 ID 或拉黑原因",
-}
-
-@dataclass
-class UserInfo:
-    user_id: int
-    nickname: str
-    username: Optional[str]
-    registration_time: datetime.datetime
-    is_blocked: bool = False
-    block_reason: Optional[str] = None
-    block_time: Optional[datetime.datetime] = None
+    def set_escape_markdown_v2(self, escape_func: Callable[[str], str]):
+        self.escape_markdown_v2 = escape_func
+        logger.debug("escape_markdown_v2 set for ForwardMessageHandler")
 
     @staticmethod
-    def format(user: 'UserInfo', blocked: bool = False) -> str:
-        info = (
-            f"ID: {user.user_id}\n"
-            f"昵称: {user.nickname}\n"
-            f"Username: {'@' + user.username if user.username else '无'}\n"
-            f"主页: tg://user?id={user.user_id}\n"
-            f"注册时间: {user.registration_time.astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')} UTC+8"
-        )
-        if blocked and user.block_time:
-            info += f"\n拉黑时间: {user.block_time.astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')} UTC+8"
-        return info
+    async def _get_reply_method(update: Update, context: ContextTypes.DEFAULT_TYPE, is_button: bool,
+                                default_chat_id: int):
+        if is_button and update.callback_query and update.callback_query.message:
+            logger.debug(f"Using callback_query.message.reply_text for chat_id={update.callback_query.message.chat_id}")
+            return update.callback_query.message.reply_text
+        elif update.message:
+            logger.debug(f"Using message.reply_text for chat_id={update.message.chat_id}")
+            return update.message.reply_text
+        elif update.callback_query and not is_button:
+            # 处理非按钮触发的 CallbackQuery（例如验证按钮）
+            logger.debug(f"Using callback_query.message.reply_text for chat_id={update.callback_query.message.chat_id}")
+            return update.callback_query.message.reply_text
+        logger.debug(f"Falling back to send_message for default_chat_id={default_chat_id}")
+        return lambda text, **kwargs: context.bot.send_message(chat_id=default_chat_id, text=text, **kwargs)
 
-@dataclass
-class Verification:
-    user_id: int
-    question: str
-    answer: float
-    options: List[float]
-    verified: bool
-    verification_time: datetime.datetime
-    error_count: int = 0
-    message_id: Optional[int] = None
+    async def get_current_chat_with_validation(self, admin_id: int) -> Tuple[
+        Optional[int], Optional[UserInfo], Optional[str]]:
+        try:
+            async with asyncio.timeout(5):
+                target_user_id = self.current_chats.get(admin_id)
+                if not target_user_id:
+                    logger.debug(f"No current chat target for admin {admin_id}")
+                    return None, None, "请先选择目标用户（使用 /chat 或按钮）"
 
-    def update(self, **kwargs):
-        for key, value in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+                async with self.db.transaction():
+                    user_info = await self.db.get_user_info(target_user_id)
+                    if not user_info:
+                        logger.warning(f"User {target_user_id} not found for admin {admin_id}, clearing chat state")
+                        await self.clear_chat_state(admin_id)
+                        return None, None, "用户不存在"
+                    if user_info.is_blocked:
+                        logger.warning(f"User {target_user_id} is blocked for admin {admin_id}, clearing chat state")
+                        await self.clear_chat_state(admin_id)
+                        return None, None, "用户已拉黑"
+                    if not await self.db.is_verified(target_user_id):
+                        logger.warning(
+                            f"User {target_user_id} is not verified for admin {admin_id}, clearing chat state")
+                        await self.clear_chat_state(admin_id)
+                        return None, None, "用户未验证"
+                    logger.debug(f"Validated chat target {target_user_id} for admin {admin_id}")
+                    return target_user_id, user_info, None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout while validating chat for admin {admin_id}")
+            await self.clear_chat_state(admin_id)  # 超时情况下清除状态
+            return None, None, "操作超时，请稍后再试"
+        except Exception as e:
+            logger.error(f"Failed to validate chat for admin {admin_id}: {str(e)}", exc_info=True)
+            await self.clear_chat_state(admin_id)  # 异常情况下清除状态
+            return None, None, "操作失败，请稍后再试"
+
+    async def forward_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        message = update.message
+        if not message:
+            logger.warning(f"No message found in update for user {user.id}")
+            return
+
+        # 确定消息类型
+        message_type = "text" if message.text else "sticker" if message.sticker else "other"
+
+        # 处理管理员输入用户 ID 的情况
+        if user.id == Config.ADMIN_ID and user.id in self.application.bot_data.get('bot', {}).waiting_user_id:
+            logger.debug(f"Admin {user.id} is waiting for user ID input, command: {self.application.bot_data['bot'].waiting_user_id[user.id]}")
+            if not message.text:
+                logger.debug(f"Non-text message (type: {message_type}) received while waiting for user ID from admin {user.id}")
+                await message.reply_text("请输入有效的用户 ID（纯数字）", parse_mode=None)
+                return
+            if await self.application.bot_data['bot']._handle_interactive_user_id(update, context):
+                logger.debug(f"Processed user ID input for admin {user.id}")
             else:
-                logger.debug(f"忽略无效字段更新: {key}")
+                await message.reply_text("请输入有效的用户 ID", parse_mode=None)
+            return
+        elif user.id == Config.ADMIN_ID:
+            logger.debug(f"No waiting_user_id for admin {user.id}, proceeding with forward_message")
 
-class ConnectionContext:
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
-        self.conn: Optional[asyncpg.Connection] = None
+        if user.id == Config.ADMIN_ID:
+            # 管理员发送消息
+            target_user_id, user_info, error_msg = await self.get_current_chat_with_validation(user.id)
+            if not target_user_id or not user_info:
+                await message.reply_text(error_msg or "请先选择目标用户（/chat 或按钮）", parse_mode=None)
+                return
 
-    async def __aenter__(self) -> asyncpg.Connection:
-        self.conn = await self.pool.acquire()
-        return self.conn
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.conn:
-            await self.pool.release(self.conn)
-
-class Database:
-    def __init__(self):
-        self.pool: Optional[asyncpg.Pool] = None
-
-    async def initialize(self):
-        if self.pool:
-            logger.info(MESSAGE_TEMPLATES["db_already_initialized"])
-            await self.close()
-        try:
-            self.pool = await asyncpg.create_pool(
-                min_size=Config.POOL_MIN,
-                max_size=Config.POOL_MAX,
-                **Config.DB_CONFIG
-            )
-            await self._init_tables()
-            logger.info(MESSAGE_TEMPLATES["db_initialized"])
-        except asyncpg.exceptions.ConnectionFailureError as e:
-            logger.error(MESSAGE_TEMPLATES["db_connection_failed"].format(error=str(e)), exc_info=True)
-            raise
-        except Exception as e:
-            logger.error(MESSAGE_TEMPLATES["db_init_failed"].format(error=str(e)), exc_info=True)
-            raise
-
-    async def close(self):
-        if self.pool:
-            await self.pool.close()
-            self.pool = None
-            logger.info(MESSAGE_TEMPLATES["db_closed"])
-
-    async def _init_tables(self):
-        async with self._acquire_connection() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    nickname TEXT NOT NULL,
-                    username TEXT,
-                    registration_time TIMESTAMP NOT NULL,
-                    is_blocked BOOLEAN DEFAULT FALSE,
-                    block_reason TEXT,
-                    block_time TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS verification (
-                    user_id BIGINT PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer FLOAT NOT NULL,
-                    options FLOAT[] NOT NULL CHECK (array_length(options, 1) = 4),
-                    verified BOOLEAN DEFAULT FALSE,
-                    verification_time TIMESTAMP NOT NULL,
-                    error_count INTEGER NOT NULL DEFAULT 0,
-                    message_id BIGINT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    user_id BIGINT PRIMARY KEY,
-                    last_message_time TIMESTAMP NOT NULL
-                )
-            """)
-            # 添加索引
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_users_is_blocked ON users (is_blocked);
-                CREATE INDEX IF NOT EXISTS idx_verification_verified ON verification (verified);
-                CREATE INDEX IF NOT EXISTS idx_conversations_last_message_time ON conversations (last_message_time);
-            """)
             try:
-                await conn.execute("""
-                    ALTER TABLE verification
-                    ADD COLUMN IF NOT EXISTS message_id BIGINT
-                """)
-                logger.debug(MESSAGE_TEMPLATES["db_schema_updated"])
+                # 直接转发消息
+                await self.application.bot.forward_message(
+                    chat_id=target_user_id,
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id
+                )
+                await self.application.bot_data['bot'].send_temp_message(
+                    message.chat_id,
+                    f"消息已转发给 {user_info.nickname}"
+                )
+                logger.info(f"Message forwarded from admin {user.id} to user {target_user_id}, type: {message_type}")
+            except Forbidden:
+                logger.warning(f"Cannot forward message to user {target_user_id}: User has blocked the bot")
+                await message.reply_text("无法转发消息：目标用户已禁用机器人", parse_mode=None)
+                await self.db.block_user(target_user_id, "用户禁用机器人")
+                await self.clear_chat_state(user.id)
             except Exception as e:
-                logger.debug(MESSAGE_TEMPLATES["db_schema_update_failed"].format(error=str(e)))
+                logger.error(f"Failed to forward message to {target_user_id}: {str(e)}", exc_info=True)
+                await message.reply_text("无法转发消息，请稍后再试", parse_mode=None)
+            return
 
-    def _normalize_datetime(self, dt: datetime.datetime) -> datetime.datetime:
-        return dt.astimezone(pytz.UTC).replace(tzinfo=None) if dt.tzinfo else dt
-
-    def _validate_params(self, params: Any) -> Tuple:
-        if not isinstance(params, tuple):
-            params = (params,)
-        return tuple(self._normalize_datetime(p) if isinstance(p, datetime.datetime) else p for p in params)
-
-    def _sanitize_params(self, params: Tuple) -> str:
-        return str([p if not isinstance(p, str) else "[redacted]" for p in params])
-
-    def _acquire_connection(self) -> ConnectionContext:
-        if not self.pool:
-            raise RuntimeError(MESSAGE_TEMPLATES["db_not_initialized"])
-        return ConnectionContext(self.pool)
-
-    async def execute(self, query: str, params: Any = (), fetch: Optional[str] = None, retries: int = 3, delay: float = 0.5) -> Any:
-        for attempt in range(retries):
-            async with self._acquire_connection() as conn:
+        # 普通用户发送消息
+        async with self.db.transaction():
+            if await self.db.is_blocked(user.id):
+                logger.debug(f"User {user.id} is blocked, rejecting message")
+                await message.reply_text("您已被拉黑，无法使用机器人", parse_mode=None)
+                return
+            is_verified = await self.db.is_verified(user.id)
+            logger.debug(f"Verification check for user {user.id}: is_verified={is_verified}")
+            if not is_verified:
+                logger.debug(f"User {user.id} is not verified, deleting message and prompting for verification")
                 try:
-                    normalized_params = self._validate_params(params)
-                    logger.debug(f"执行查询: {query}", extra={"params": self._sanitize_params(normalized_params)})
-                    if fetch == "one":
-                        return await conn.fetchrow(query, *normalized_params)
-                    elif fetch == "all":
-                        return await conn.fetch(query, *normalized_params)
-                    elif fetch == "val":
-                        return await conn.fetchval(query, *normalized_params)
-                    await conn.execute(query, *normalized_params)
-                    return
-                except asyncpg.exceptions.DeadlockDetectedError as e:
-                    logger.warning(f"死锁检测到，重试 {attempt + 1}/{retries}: {str(e)}")
-                    if attempt < retries - 1:
-                        await asyncio.sleep(delay * (2 ** attempt))  # 指数退避
-                    else:
-                        logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)), exc_info=True)
-                        raise
-                except asyncpg.exceptions.PostgresError as e:
-                    logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)), exc_info=True)
-                    raise
+                    await message.delete()
+                    logger.debug(f"Deleted message from unverified user {user.id}")
                 except Exception as e:
-                    logger.error(MESSAGE_TEMPLATES["db_unexpected_error"].format(error=str(e)), exc_info=True)
-                    raise
+                    logger.warning(f"Failed to delete message from unverified user {user.id}: {str(e)}")
+                await self.application.bot_data['bot'].reply_error(update, "请先完成人机验证，使用 /start 开始")
+                return
 
-    @asynccontextmanager
-    async def transaction(self):
-        async with self._acquire_connection() as conn:
-            transaction = conn.transaction()
-            await transaction.start()
-            try:
-                yield conn
-                await transaction.commit()
-            except Exception:
-                await transaction.rollback()
-                raise
+            await self.db.update_conversation(user.id)
+            logger.debug(f"Updated conversation for user {user.id}")
 
-    async def add_user(self, user: UserInfo):
-        if not isinstance(user.user_id, int) or not user.nickname:
-            raise ValueError(MESSAGE_TEMPLATES["invalid_user_data"])
-        await self.execute(
-            """
-            INSERT INTO users (user_id, nickname, username, registration_time)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id) DO UPDATE
-            SET nickname = EXCLUDED.nickname, username = EXCLUDED.username
-            """,
-            (user.user_id, user.nickname, user.username, self._normalize_datetime(user.registration_time))
-        )
-
-    async def block_user(self, user_id: int, reason: str):
-        if not isinstance(user_id, int) or not reason:
-            raise ValueError(MESSAGE_TEMPLATES["invalid_block_data"])
-        async with self.transaction():
-            await self.execute(
-                """
-                UPDATE users
-                SET is_blocked = TRUE, block_reason = $1, block_time = $2
-                WHERE user_id = $3
-                """,
-                (reason[:255], self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)), user_id)
-            )
-            await self.execute(
-                """
-                UPDATE verification
-                SET verified = FALSE, error_count = 0, message_id = NULL
-                WHERE user_id = $1
-                """,
-                (user_id,)
-            )
-            logger.debug(f"User {user_id} blocked, verification state reset")
-
-    async def unblock_user(self, user_id: int):
-        if not isinstance(user_id, int):
-            raise ValueError(MESSAGE_TEMPLATES["invalid_block_data"])
-        async with self.transaction():
-            try:
-                # 检查用户是否存在
-                user_exists = await self.execute(
-                    "SELECT 1 FROM users WHERE user_id = $1",
-                    (user_id,),
-                    fetch="val"
-                )
-                if not user_exists:
-                    logger.error(f"Cannot unblock user {user_id}: User does not exist")
-                    raise ValueError("用户不存在")
-                # 清除现有验证记录
-                await self.execute(
-                    "DELETE FROM verification WHERE user_id = $1",
-                    (user_id,)
-                )
-                # 插入新的默认验证记录
-                verification = Verification(
-                    user_id=user_id,
-                    question="",
-                    answer=0.0,
-                    options=[],
-                    verified=False,
-                    verification_time=self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)),
-                    error_count=0,
-                    message_id=None
-                )
-                await self.add_verification(verification)
-                # 更新用户拉黑状态
-                await self.execute(
-                    """
-                    UPDATE users
-                    SET is_blocked   = FALSE,
-                        block_reason = NULL,
-                        block_time   = NULL
-                    WHERE user_id = $1
-                    """,
-                    (user_id,)
-                )
-                # 清除对话记录（确保不影响管理员的当前对话目标）
-                await self.execute(
-                    "DELETE FROM conversations WHERE user_id = $1",
-                    (user_id,)
-                )
-                logger.info(f"User {user_id} unblocked, verification and conversation state reset")
-            except Exception as e:
-                logger.error(f"Error unblocking user {user_id}: {str(e)}", exc_info=True)
-                raise
-
-    async def is_blocked(self, user_id: int) -> bool:
-        result = await self.execute(
-            "SELECT is_blocked FROM users WHERE user_id = $1",
-            (user_id,),
-            fetch="val"
-        )
-        return bool(result)
-
-    async def get_user_info(self, user_id: int) -> Optional[UserInfo]:
-        result = await self.execute(
-            "SELECT * FROM users WHERE user_id = $1",
-            (user_id,),
-            fetch="one"
-        )
-        return UserInfo(**result) if result else None
-
-    async def get_recent_users(self) -> List[UserInfo]:
-        results = await self.execute(
-            """
-            SELECT u.* FROM users u
-            JOIN verification v ON u.user_id = v.user_id
-            WHERE v.verified = TRUE
-            ORDER BY v.verification_time DESC LIMIT 3
-            """,
-            fetch="all"
-        )
-        return [UserInfo(**r) for r in results]
-
-    async def get_blacklist(self) -> List[UserInfo]:
-        results = await self.execute(
-            """
-            SELECT * FROM users
-            WHERE is_blocked = TRUE
-            ORDER BY block_time DESC LIMIT 5
-            """,
-            fetch="all"
-        )
-        return [UserInfo(**r) for r in results]
-
-    async def get_stats(self) -> Dict:
-        result = await self.execute(
-            """
-            SELECT 
-                COUNT(DISTINCT u.user_id) as total_users,
-                COUNT(DISTINCT u.user_id) FILTER (WHERE u.registration_time::date = CURRENT_DATE) as new_users,
-                COUNT(DISTINCT u.user_id) FILTER (WHERE u.is_blocked = TRUE) as blocked_users,
-                COUNT(DISTINCT v.user_id) FILTER (WHERE v.verified = TRUE) as verified_users
-            FROM users u
-            LEFT JOIN verification v ON u.user_id = v.user_id
-            """,
-            fetch="one"
-        )
-        return dict(result)
-
-    async def add_verification(self, verification: Verification):
-        await self.execute(
-            """
-            INSERT INTO verification (
-                user_id, question, answer, options, verified,
-                verification_time, error_count, message_id
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (user_id) DO UPDATE
-            SET question = EXCLUDED.question,
-                answer = EXCLUDED.answer,
-                options = EXCLUDED.options,
-                verified = EXCLUDED.verified,
-                verification_time = EXCLUDED.verification_time,
-                error_count = EXCLUDED.error_count,
-                message_id = EXCLUDED.message_id
-            """,
-            (
-                verification.user_id,
-                verification.question,
-                verification.answer,
-                verification.options,
-                verification.verified,
-                self._normalize_datetime(verification.verification_time),
-                verification.error_count,
-                verification.message_id
-            )
-        )
-
-    async def update_verification(self, verification: Verification):
-        await self.execute(
-            """
-            UPDATE verification
-            SET question = $2, answer = $3, options = $4, verified = $5,
-                verification_time = $6, error_count = $7, message_id = $8
-            WHERE user_id = $1
-            """,
-            (
-                verification.user_id,
-                verification.question,
-                verification.answer,
-                verification.options,
-                verification.verified,
-                self._normalize_datetime(verification.verification_time),
-                verification.error_count,
-                verification.message_id
-            )
-        )
-
-    async def verify_user(self, user_id: int):
-        async with self.transaction():
-            try:
-                result = await self.execute(
-                    """
-                    UPDATE verification
-                    SET verified = TRUE, verification_time = $2, message_id = NULL
-                    WHERE user_id = $1
-                    RETURNING verified
-                    """,
-                    (user_id, self._normalize_datetime(datetime.datetime.now(BEIJING_TZ))),
-                    fetch="val"
-                )
-                # 检查更新是否成功
-                if result is None or result == 0:
-                    logger.error(f"Failed to verify user {user_id}: No verification record found")
-                    raise ValueError("用户验证记录不存在")
-                logger.debug(f"User {user_id} marked as verified in database")
-                # 验证更新结果
-                is_verified = await self.is_verified(user_id)
-                if not is_verified:
-                    logger.error(f"Verification state not updated for user {user_id} after verify_user")
-                    raise RuntimeError("验证状态更新失败")
-            except Exception as e:
-                logger.error(f"Error verifying user {user_id}: {str(e)}", exc_info=True)
-                raise
-
-    async def is_verified(self, user_id: int) -> bool:
         try:
-            result = await self.execute(
-                """
-                SELECT verified FROM verification
-                WHERE user_id = $1
-                """,
-                (user_id,),
-                fetch="val"
+            # 直接转发消息给管理员
+            admin_id = Config.ADMIN_ID
+            await self.application.bot.forward_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id
             )
-            verified = bool(result) if result is not None else False
-            logger.debug(f"Checked verification status for user {user_id}: verified={verified}")
-            return verified
+            await self.application.bot_data['bot'].send_temp_message(message.chat_id, "消息已转发")
+            logger.info(f"Message forwarded from user {user.id} to admin {admin_id}, type: {message_type}")
+        except Forbidden:
+            logger.warning(f"Cannot forward message to admin {admin_id}: Admin has blocked the bot")
+            await message.reply_text("无法转发消息：管理员不可用", parse_mode=None)
         except Exception as e:
-            logger.error(f"Error checking verification status for user {user_id}: {str(e)}", exc_info=True)
-            return False
+            logger.error(f"Failed to forward message to admin {admin_id}: {str(e)}", exc_info=True)
+            await message.reply_text("无法转发消息，请稍后再试", parse_mode=None)
 
-    async def get_verification(self, user_id: int) -> Optional[Verification]:
-        result = await self.execute(
-            """
-            SELECT * FROM verification
-            WHERE user_id = $1
-            """,
-            (user_id,),
-            fetch="one"
-        )
-        return Verification(**result) if result else None
+    async def switch_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int,
+                        is_button: bool = False):
+        admin_id = update.effective_user.id
+        # 允许非管理员 update（用于自动切换），但必须明确指定 admin_id
+        if admin_id != Config.ADMIN_ID:
+            if update.effective_user.id != Config.ADMIN_ID:
+                logger.debug(f"Non-admin user {admin_id} attempted to switch chat to user {user_id}")
+                # 不发送错误消息，因为可能是自动切换
+                return
+            admin_id = Config.ADMIN_ID  # 强制使用管理员 ID
 
-    async def update_conversation(self, user_id: int):
-        await self.execute(
-            """
-            INSERT INTO conversations (user_id, last_message_time)
-            VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE
-            SET last_message_time = EXCLUDED.last_message_time
-            """,
-            (user_id, self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)))
-        )
+        reply_method = await self._get_reply_method(update, context, is_button, admin_id)
 
-    async def clean_database(self):
-        async with self.transaction() as conn:
-            await conn.execute("DELETE FROM users")
-            await conn.execute("DELETE FROM verification")
-            await conn.execute("DELETE FROM conversations")
-            logger.info(MESSAGE_TEMPLATES["db_cleared"])
+        try:
+            async with asyncio.timeout(10):
+                async with self.db.transaction():
+                    user_info = await self.db.get_user_info(user_id)
+                    if not user_info:
+                        await reply_method("用户不存在", parse_mode=None)
+                        logger.warning(f"User {user_id} not found for admin {admin_id}")
+                        return
+                    if user_info.is_blocked:
+                        await reply_method("无法切换：用户已拉黑", parse_mode=None)
+                        logger.warning(f"User {user_id} is blocked for admin {admin_id}")
+                        return
+                    if not await self.db.is_verified(user_id):
+                        await reply_method("无法切换：用户未验证", parse_mode=None)
+                        logger.warning(f"User {user_id} is not verified for admin {admin_id}")
+                        return
+        except asyncio.TimeoutError:
+            await reply_method("操作超时，请稍后再试", parse_mode=None)
+            logger.warning(f"Timeout while validating user {user_id} in switch_chat for admin {admin_id}")
+            return
+        except Exception as e:
+            await reply_method("操作失败，请稍后再试", parse_mode=None)
+            logger.error(f"Failed to check user {user_id} in switch_chat for admin {admin_id}: {str(e)}", exc_info=True)
+            return
 
-    # 在Database类中添加get_verified_users方法
-    async def get_verified_users(self) -> List[UserInfo]:
-        results = await self.execute(
-            """
-            SELECT u.* FROM users u
-            JOIN verification v ON u.user_id = v.user_id
-            WHERE v.verified = TRUE
-            ORDER BY v.verification_time DESC
-            """,
-            fetch="all"
-        )
-        return [UserInfo(**r) for r in results]
+        bot = self.application.bot_data.get('bot')
+        if bot and admin_id in bot.pending_request:
+            del bot.pending_request[admin_id]
+        if bot and admin_id in bot.waiting_user_id:
+            del bot.waiting_user_id[admin_id]
+        logger.debug(f"Cleared pending_request and waiting_user_id for admin {admin_id} in switch_chat")
+
+        self.current_chats[admin_id] = user_id
+        await self.reset_timer(admin_id, Config.CHAT_TIMEOUT, self.reset_chat)
+        logger.debug(f"Admin {admin_id} set target to user {user_id}, current_chats: {self.current_chats}")
+
+        try:
+            escaped_nickname = self.escape_markdown_v2(
+                user_info.nickname or "未知用户") if self.escape_markdown_v2 else user_info.nickname
+            await reply_method(
+                text=f"已将对话目标切换为“[{escaped_nickname}](tg://user?id={user_id})”",
+                parse_mode="MarkdownV2"
+            )
+            logger.info(f"Admin {admin_id} switched to user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send switch confirmation for admin {admin_id} to user {user_id}: {str(e)}",
+                        exc_info=True)
+
+    async def clear_chat_state(self, admin_id: int):
+        if admin_id in self.current_chats:
+            logger.debug(f"Clearing chat state for admin {admin_id}, target: {self.current_chats[admin_id]}")
+            self.current_chats.pop(admin_id, None)
+        if admin_id in self.chat_timers:
+            self.chat_timers[admin_id].cancel()
+            del self.chat_timers[admin_id]
+            logger.debug(f"Cancelled chat timer for admin {admin_id}")
+
+    async def reset_chat(self, admin_id: int):
+        if admin_id in self.current_chats:
+            target_user_id = self.current_chats[admin_id]
+            try:
+                user_info = await self.db.get_user_info(target_user_id)
+                nickname = user_info.nickname if user_info else "未知用户"
+                escaped_nickname = self.escape_markdown_v2(nickname) if self.escape_markdown_v2 else nickname
+                await self.application.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"与“[{escaped_nickname}](tg://user?id={target_user_id})”的对话已超时重置，当前无对话目标",
+                    parse_mode="MarkdownV2"
+                )
+                logger.info(f"Chat reset for admin {admin_id} due to timeout, target: {target_user_id}")
+            except Exception as e:
+                logger.error(f"Failed to send timeout reset message to admin {admin_id} for target {target_user_id}: {str(e)}", exc_info=True)
+            self.current_chats.pop(admin_id, None)
+        if admin_id in self.chat_timers:
+            self.chat_timers.pop(admin_id, None)
+            logger.debug(f"Removed chat timer for admin {admin_id} after reset")
+
+    async def reset_timer(self, admin_id: int, timeout: int, callback):
+        try:
+            if admin_id in self.chat_timers:
+                self.chat_timers[admin_id].cancel()
+                logger.debug(f"Cancelled existing timer for admin {admin_id}")
+            loop = asyncio.get_event_loop()
+            self.chat_timers[admin_id] = loop.call_later(
+                timeout, lambda: asyncio.create_task(callback(admin_id))
+            )
+            logger.debug(f"Timer reset for admin {admin_id}, timeout: {timeout}s")
+        except Exception as e:
+            logger.error(f"Failed to reset timer for admin {admin_id}: {str(e)}", exc_info=True)
