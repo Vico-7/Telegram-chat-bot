@@ -1,10 +1,9 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import ContextTypes
+from telegram.ext import Application
 from typing import List
 import asyncio
 from logger import logger
-from telegram.ext import Application
 
 def escape_markdown_v2(text: str) -> str:
     """转义 MarkdownV2 特殊字符，确保兼容数学表达式"""
@@ -14,10 +13,9 @@ def escape_markdown_v2(text: str) -> str:
     return ''.join(f'\\{c}' if c in special_chars else c for c in text)
 
 async def send_temp_message(
-    application: Application, 
-    chat_id: int, 
-    text: str, 
-    context: ContextTypes.DEFAULT_TYPE, 
+    application: Application,
+    chat_id: int,
+    text: str,
     delay: float = 1.0
 ) -> None:
     """
@@ -27,7 +25,6 @@ async def send_temp_message(
         application: Telegram 应用实例。
         chat_id: 目标聊天 ID。
         text: 要发送的消息内容。
-        context: Telegram 上下文对象（未使用，保留以兼容调用）。
         delay: 消息显示的秒数，默认 1 秒。
 
     Raises:
