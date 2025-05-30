@@ -54,7 +54,7 @@ class VerificationHandler:
         self.db = db
 
     async def handle_verification_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int,
-                                         answer: float):
+                                        answer: float):
         query = update.callback_query
         try:
             async with self.db.transaction():
@@ -98,35 +98,11 @@ class VerificationHandler:
                     )
                     logger.info(f"User {user_id} passed verification")
 
-                    # 检查管理员是否无对话目标，若无则自动切换
-                    admin_id = Config.ADMIN_ID
-                    target_user_id, user_info, error_msg = await self.bot.forward_handler.get_current_chat_with_validation(
-                        admin_id)
-                    if not target_user_id:
-                        try:
-                            # 直接调用 switch_chat 的核心逻辑，避免伪 Update
-                            user_info = await self.db.get_user_info(user_id)
-                            if user_info and not user_info.is_blocked and await self.db.is_verified(user_id):
-                                self.bot.forward_handler.current_chats[admin_id] = user_id
-                                await self.bot.forward_handler.reset_timer(admin_id, Config.CHAT_TIMEOUT,
-                                                                           self.bot.forward_handler.reset_chat)
-                                escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
-                                await self.bot.application.bot.send_message(
-                                    chat_id=admin_id,
-                                    text=f"已将对话目标切换为“[{escaped_nickname}](tg://user?id={user_id})”",
-                                    parse_mode="MarkdownV2"
-                                )
-                                logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
-                            else:
-                                logger.warning(f"Auto-switch failed: invalid user {user_id} (blocked or not verified)")
-                        except Exception as e:
-                            logger.error(f"Failed to auto-switch admin {admin_id} chat to user {user_id}: {str(e)}",
-                                         exc_info=True)
-                    else:
-                        logger.debug(f"Admin {admin_id} already has chat target {target_user_id}, skipping auto-switch")
-
-                    # 通知管理员
+                    # 发送验证成功的通知
                     user_info = await self.db.get_user_info(user_id)
+                    if not user_info:
+                        logger.error(f"User info not found for user {user_id} after verification")
+                        return
                     notification_message = (
                         f"用户通过验证:\n{UserInfo.format(user_info, blocked=False)}\n"
                         f"验证尝试次数: {verification.error_count + 1}\n"
@@ -145,6 +121,37 @@ class VerificationHandler:
                         user_id=user_id,
                         buttons=buttons
                     )
+
+                    # 检查管理员是否无对话目标，若无则自动切换
+                    admin_id = Config.ADMIN_ID
+                    target_user_id, _, error_msg = await self.bot.forward_handler.get_current_chat_with_validation(admin_id)
+                    if target_user_id:
+                        logger.debug(f"Admin {admin_id} already has chat target {target_user_id}, skipping auto-switch")
+                        return
+
+                    # 确保用户未被拉黑且已验证
+                    if user_info.is_blocked:
+                        logger.debug(f"User {user_id} is blocked, skipping auto-switch")
+                        return
+                    if not await self.db.is_verified(user_id):
+                        logger.debug(f"User {user_id} is not verified, skipping auto-switch")
+                        return
+
+                    try:
+                        # 直接设置对话目标并发送切换通知
+                        self.bot.forward_handler.current_chats[admin_id] = user_id
+                        await self.bot.forward_handler.reset_timer(admin_id, Config.CHAT_TIMEOUT,
+                                                                self.bot.forward_handler.reset_chat)
+                        escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
+                        await self.bot.application.bot.send_message(
+                            chat_id=admin_id,
+                            text=f"对话目标已自动切换为“[{escaped_nickname}](tg://user?id={user_id})”",
+                            parse_mode="MarkdownV2"
+                        )
+                        logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-switch admin {admin_id} chat to user {user_id}: {str(e)}",
+                                    exc_info=True)
                 else:
                     # 验证失败
                     await self.bot.ban_handler.handle_verification_failure(user_id, verification, reason="wrong_answer")
