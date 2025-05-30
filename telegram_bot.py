@@ -17,6 +17,7 @@ import asyncpg
 
 BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 
+
 class CommandType(enum.Enum):
     BAN = "ban"
     UNBAN = "unban"
@@ -26,6 +27,7 @@ class CommandType(enum.Enum):
     STATUS = "status"
     CLEAN = "clean"
     COUNT = "count"
+
 
 def handle_errors(func):
     @wraps(func)
@@ -37,17 +39,22 @@ def handle_errors(func):
                 f"telegram_{type(e).__name__.lower()}",
                 Config.MESSAGE_TEMPLATES["telegram_error_generic"]
             )
-            logger.error(f"Error in {func.__name__} for update {update.update_id if update else 'unknown'}: {str(e)}", exc_info=True)
+            logger.error(f"Error in {func.__name__} for update {update.update_id if update else 'unknown'}: {str(e)}",
+                         exc_info=True)
             await self.reply_error(update, error_msg)
+
     return wrapper
+
 
 class VerificationHandler:
     """处理人机验证按钮的逻辑"""
+
     def __init__(self, bot: 'TelegramBot', db: Database):
         self.bot = bot
         self.db = db
 
-    async def handle_verification_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, answer: float):
+    async def handle_verification_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int,
+                                         answer: float):
         query = update.callback_query
         try:
             async with self.db.transaction():
@@ -67,7 +74,8 @@ class VerificationHandler:
                     return
 
                 if verification.message_id != query.message.message_id:
-                    logger.debug(f"Verification message ID mismatch for user {user_id}: expected {verification.message_id}, got {query.message.message_id}")
+                    logger.debug(
+                        f"Verification message ID mismatch for user {user_id}: expected {verification.message_id}, got {query.message.message_id}")
                     await query.message.edit_text("验证消息已过期，请重新使用 /start", parse_mode=None)
                     return
 
@@ -81,7 +89,7 @@ class VerificationHandler:
                     # 验证成功
                     verification.verified = True
                     verification.verification_time = self.db._normalize_datetime(datetime.datetime.now(BEIJING_TZ))
-                    verification.message_id = None  # 清除 message_id
+                    verification.message_id = None
                     await self.db.update_verification(verification)
                     await query.message.edit_text(
                         "🎉 *验证通过！欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊",
@@ -89,11 +97,46 @@ class VerificationHandler:
                         reply_markup=None
                     )
                     logger.info(f"User {user_id} passed verification")
+
+                    # 检查管理员是否无对话目标，若无则自动切换
+                    admin_id = Config.ADMIN_ID
+                    target_user_id, user_info, error_msg = await self.bot.forward_handler.get_current_chat_with_validation(
+                        admin_id)
+                    if not target_user_id:
+                        try:
+                            # 构造伪 Update 对象，模拟管理员操作
+                            from telegram import User, Chat, Message
+                            admin_user = User(id=admin_id, first_name="", is_bot=False)
+                            admin_chat = Chat(id=admin_id, type="private")
+                            admin_message = Message(
+                                message_id=0,  # 伪消息 ID
+                                date=datetime.datetime.now(),
+                                chat=admin_chat,
+                                from_user=admin_user
+                            )
+                            admin_update = Update(
+                                update_id=update.update_id + 1,  # 避免重复 ID
+                                message=admin_message,
+                                callback_query=None
+                            )
+                            await self.bot.forward_handler.switch_chat(
+                                update=admin_update,
+                                context=context,
+                                user_id=user_id,
+                                is_button=False
+                            )
+                            logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to auto-switch admin {admin_id} chat to user {user_id}: {str(e)}",
+                                         exc_info=True)
+                    else:
+                        logger.debug(f"Admin {admin_id} already has chat target {target_user_id}, skipping auto-switch")
+
                     # 通知管理员
                     user_info = await self.db.get_user_info(user_id)
                     notification_message = (
                         f"用户通过验证:\n{UserInfo.format(user_info, blocked=False)}\n"
-                        f"验证尝试次数: {verification.error_count + 1}\n"  # 保持现有逻辑
+                        f"验证尝试次数: {verification.error_count + 1}\n"
                         f"验证题目: {verification.question}\n"
                         f"正确答案: {verification.answer}"
                     )
@@ -128,12 +171,14 @@ class VerificationHandler:
 
 class BanHandler:
     """处理所有拉黑相关的逻辑"""
+
     def __init__(self, bot: 'TelegramBot', db: Database, forward_handler: 'ForwardMessageHandler'):
         self.bot = bot
         self.db = db
         self.forward_handler = forward_handler
 
-    async def _send_verification_message(self, user_id: int, verification: Verification, question_message: str, options: List[float]) -> bool:
+    async def _send_verification_message(self, user_id: int, verification: Verification, question_message: str,
+                                         options: List[float]) -> bool:
         try:
             if verification.message_id:
                 try:
@@ -146,7 +191,8 @@ class BanHandler:
                     )
                     logger.debug(f"Edited verification message {verification.message_id} for user {user_id}")
                 except (BadRequest, Forbidden) as e:
-                    logger.debug(f"Failed to edit verification message {verification.message_id} for user {user_id}: {str(e)}")
+                    logger.debug(
+                        f"Failed to edit verification message {verification.message_id} for user {user_id}: {str(e)}")
                     verification.message_id = None
             if not verification.message_id:
                 msg = await self.bot.application.bot.send_message(
@@ -176,97 +222,98 @@ class BanHandler:
             logger.error(f"Failed to send/edit verification message to user {user_id}: {str(e)}", exc_info=True)
             return False
 
-    async def ban_user(self, user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                        is_button: bool = False, needs_confirmation: bool = True, reason: str = "管理员操作",
-                        admin_id: Optional[int] = None) -> bool:
-            try:
-                async with asyncio.timeout(10):
-                    user_info = await self.db.get_user_info(user_id)
-                    if not user_info:
-                        if update:
-                            await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_not_found"])
-                        else:
-                            logger.warning(f"User {user_id} not found, no valid update to reply")
-                        return False
-                    if user_info.is_blocked:
-                        if update:
-                            await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_already_blocked"])
-                        else:
-                            logger.warning(f"User {user_id} already blocked, no valid update to reply")
-                        return False
-
-                    effective_admin_id = admin_id or Config.ADMIN_ID
-
-                    if not is_button or not needs_confirmation:
-                        try:
-                            async with self.db.transaction():
-                                await self.db.block_user(user_id, reason)
-                        except asyncpg.exceptions.PostgresError as e:
-                            logger.error(f"Database error banning user {user_id}: {str(e)}", exc_info=True)
-                            if update:
-                                await self.bot.reply_error(update, "数据库操作失败，请稍后重试")
-                            return False
-
-                        if user_id in self.bot.verification_timers:
-                            self.bot.verification_timers[user_id].cancel()
-                            del self.bot.verification_timers[user_id]
-                            logger.debug(f"Cancelled verification timer for user {user_id} during ban")
-
-                        await self.forward_handler.clear_chat_state(effective_admin_id)
-                        
-                        # 仅在 update 有效时发送成功消息
-                        if update and update.effective_user:
-                            buttons = [[InlineKeyboardButton("✅ 解除拉黑", callback_data=f"cb_unban_{user_id}")]]
-                            reply_markup = InlineKeyboardMarkup(buttons)
-                            reply_method = await self.bot._get_reply_method(update, is_button)
-                            if callable(reply_method) and reply_method.__name__ != "<lambda>":  # 确保 reply_method 有效
-                                msg = await reply_method(
-                                    f"已成功拉黑用户 {user_id}",
-                                    parse_mode=None,
-                                    reply_markup=reply_markup
-                                )
-                                context.user_data['ban_success_message_id'] = msg.message_id
-                            else:
-                                logger.debug(f"Skipping ban success message for user {user_id}, invalid reply method")
-                        else:
-                            logger.debug(f"Skipping ban success message for user {user_id}, no valid update")
-                        logger.info(f"Admin {effective_admin_id} banned user {user_id} with reason: {reason}")
-                        return True
-
-                    if not update:  # 如果没有有效的 update，直接返回 False
-                        logger.warning(f"Cannot send ban confirmation for user {user_id}, no valid update")
-                        return False
-
-                    escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
-                    buttons = [
-                        [
-                            InlineKeyboardButton("确认拉黑 🚫", callback_data=f"confirm_ban_{user_id}"),
-                            InlineKeyboardButton("取消 ❌", callback_data=f"cancel_ban_{user_id}")
-                        ]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(buttons)
-                    warning_message = (
-                        f"⚠️ *即将拉黑用户* ⚠️\n\n"
-                        f"您将拉黑 [{escaped_nickname}](tg://user?id={user_id})。\n"
-                        f"拉黑后，用户将无法使用机器人，且对话记录将被清空。\n"
-                        f"请确认是否继续？"
-                    )
-                    msg = await self.bot.reply_success(update, warning_message, parse_mode="MarkdownV2", reply_markup=reply_markup)
-                    if msg:
-                        context.user_data['ban_message_id'] = msg.message_id
+    async def ban_user(self, user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       is_button: bool = False, needs_confirmation: bool = True, reason: str = "管理员操作",
+                       admin_id: Optional[int] = None) -> bool:
+        try:
+            async with asyncio.timeout(10):
+                user_info = await self.db.get_user_info(user_id)
+                if not user_info:
+                    if update:
+                        await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_not_found"])
+                    else:
+                        logger.warning(f"User {user_id} not found, no valid update to reply")
                     return False
-            except Exception as e:
-                logger.error(f"Error banning user {user_id}: {str(e)}", exc_info=True)
-                if update:
-                    await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_error_generic"])
-                else:
-                    logger.warning(f"Cannot send error reply for user {user_id}, no valid update")
-                return False
-            finally:
+                if user_info.is_blocked:
+                    if update:
+                        await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_already_blocked"])
+                    else:
+                        logger.warning(f"User {user_id} already blocked, no valid update to reply")
+                    return False
+
                 effective_admin_id = admin_id or Config.ADMIN_ID
-                self.bot.pending_request.pop(effective_admin_id, None)
-                self.bot.waiting_user_id.pop(effective_admin_id, None)
-                logger.debug(f"Cleared state for admin {effective_admin_id}")
+
+                if not is_button or not needs_confirmation:
+                    try:
+                        async with self.db.transaction():
+                            await self.db.block_user(user_id, reason)
+                    except asyncpg.exceptions.PostgresError as e:
+                        logger.error(f"Database error banning user {user_id}: {str(e)}", exc_info=True)
+                        if update:
+                            await self.bot.reply_error(update, "数据库操作失败，请稍后重试")
+                        return False
+
+                    if user_id in self.bot.verification_timers:
+                        self.bot.verification_timers[user_id].cancel()
+                        del self.bot.verification_timers[user_id]
+                        logger.debug(f"Cancelled verification timer for user {user_id} during ban")
+
+                    await self.forward_handler.clear_chat_state(effective_admin_id)
+
+                    # 仅在 update 有效时发送成功消息
+                    if update and update.effective_user:
+                        buttons = [[InlineKeyboardButton("✅ 解除拉黑", callback_data=f"cb_unban_{user_id}")]]
+                        reply_markup = InlineKeyboardMarkup(buttons)
+                        reply_method = await self.bot._get_reply_method(update, is_button)
+                        if callable(reply_method) and reply_method.__name__ != "<lambda>":  # 确保 reply_method 有效
+                            msg = await reply_method(
+                                f"已成功拉黑用户 {user_id}",
+                                parse_mode=None,
+                                reply_markup=reply_markup
+                            )
+                            context.user_data['ban_success_message_id'] = msg.message_id
+                        else:
+                            logger.debug(f"Skipping ban success message for user {user_id}, invalid reply method")
+                    else:
+                        logger.debug(f"Skipping ban success message for user {user_id}, no valid update")
+                    logger.info(f"Admin {effective_admin_id} banned user {user_id} with reason: {reason}")
+                    return True
+
+                if not update:  # 如果没有有效的 update，直接返回 False
+                    logger.warning(f"Cannot send ban confirmation for user {user_id}, no valid update")
+                    return False
+
+                escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
+                buttons = [
+                    [
+                        InlineKeyboardButton("确认拉黑 🚫", callback_data=f"confirm_ban_{user_id}"),
+                        InlineKeyboardButton("取消 ❌", callback_data=f"cancel_ban_{user_id}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(buttons)
+                warning_message = (
+                    f"⚠️ *即将拉黑用户* ⚠️\n\n"
+                    f"您将拉黑 [{escaped_nickname}](tg://user?id={user_id})。\n"
+                    f"拉黑后，用户将无法使用机器人，且对话记录将被清空。\n"
+                    f"请确认是否继续？"
+                )
+                msg = await self.bot.reply_success(update, warning_message, parse_mode="MarkdownV2",
+                                                   reply_markup=reply_markup)
+                if msg:
+                    context.user_data['ban_message_id'] = msg.message_id
+                return False
+        except Exception as e:
+            logger.error(f"Error banning user {user_id}: {str(e)}", exc_info=True)
+            if update:
+                await self.bot.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_error_generic"])
+            else:
+                logger.warning(f"Cannot send error reply for user {user_id}, no valid update")
+            return False
+        finally:
+            effective_admin_id = admin_id or Config.ADMIN_ID
+            self.bot.pending_request.pop(effective_admin_id, None)
+            self.bot.waiting_user_id.pop(effective_admin_id, None)
+            logger.debug(f"Cleared state for admin {effective_admin_id}")
 
     async def handle_verification_failure(self, user_id: int, verification: Verification, reason: str = "wrong_answer"):
         # 清理现有定时器
@@ -297,7 +344,7 @@ class BanHandler:
                 "📝 验证规则：\n"
                 "1️⃣ 回答数学题目，点击下方选项提交答案。\n"
                 "2️⃣ 每题有 3分钟 作答时间，超时将刷新题目 ⏳\n"
-                "3️⃣ 共 3次 尝试机会，答错或超时扣除一次。\n\n"
+                "3️⃣ 共 3次 尝试机会，答错或超时扣除一次。机会用尽自动拉黑\n\n"
                 f"{error_prompt}"
                 "❓ 验证题目 ❓\n"
                 f"📌 {verification.question}\n\n"
@@ -362,6 +409,7 @@ class BanHandler:
                 buttons=buttons
             )
 
+
 class TelegramBot:
     def __init__(self, db: Database, application: Application):
         self.db = db
@@ -371,9 +419,9 @@ class TelegramBot:
         self.waiting_user_id: Dict[int, CommandType] = {}
         self.pending_request: Dict[int, Optional[CommandType]] = {}
         self.ban_handler = None
-        self.verification_handler = VerificationHandler(self, db)  # 新增验证处理器
-        self.application.bot_data['bot'] = self
-        logger.debug("Initialized TelegramBot with bot_data")
+        self.verification_handler = VerificationHandler(self, db)
+        self.application.bot_data['bot'] = self  # 确保 bot 实例存储
+        logger.info("TelegramBot initialized and stored in bot_data")
 
     def set_forward_handler(self, forward_handler: ForwardMessageHandler):
         """设置 ForwardMessageHandler 并初始化相关依赖"""
@@ -412,12 +460,13 @@ class TelegramBot:
 
     async def _check_mutex(self, update: Update, command: CommandType) -> bool:
         admin_id = update.effective_user.id
-        if admin_id in self.pending_request and self.pending_request[admin_id] in [CommandType.CHAT, CommandType.BAN, CommandType.UNBAN]:
+        if admin_id in self.pending_request and self.pending_request[admin_id] in [CommandType.CHAT, CommandType.BAN,
+                                                                                   CommandType.UNBAN]:
             await self.reply_error(update, "请先完成或取消当前操作（/chat, /ban, 或 /unban）")
             logger.debug(f"Mutex check failed for admin {admin_id}: pending {self.pending_request[admin_id]}")
             return False
         return True
-    
+
     async def _delete_request_user_id_message(self, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
         if 'request_user_id_message_id' in context.user_data:
             try:
@@ -425,14 +474,15 @@ class TelegramBot:
                     chat_id=admin_id,
                     message_id=context.user_data['request_user_id_message_id']
                 )
-                logger.debug(f"Deleted request_user_id message {context.user_data['request_user_id_message_id']} for admin {admin_id}")
+                logger.debug(
+                    f"Deleted request_user_id message {context.user_data['request_user_id_message_id']} for admin {admin_id}")
             except Exception as e:
                 logger.debug(f"Failed to delete request_user_id message for admin {admin_id}: {str(e)}")
             finally:
                 del context.user_data['request_user_id_message_id']
 
-    async def _execute_command(self, command: CommandType, update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                            user_id: Optional[int] = None, is_button: bool = False):
+    async def _execute_command(self, command: CommandType, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               user_id: Optional[int] = None, is_button: bool = False):
         if command == CommandType.BAN:
             await self.ban_handler.ban_user(
                 user_id=user_id,
@@ -488,8 +538,9 @@ class TelegramBot:
             logger.debug(f"No waiting_user_id for user {user_id}")
             return False
         command = self.waiting_user_id[user_id]
-        logger.debug(f"Processing interactive user ID for user {user_id}, command: {command}, input: {update.message.text}")
-        
+        logger.debug(
+            f"Processing interactive user ID for user {user_id}, command: {command}, input: {update.message.text}")
+
         if not update.message or not update.message.text:
             logger.debug(f"No valid text input for user {user_id}, command: {command}")
             await self.reply_error(update, "请输入有效的用户 ID")
@@ -524,7 +575,8 @@ class TelegramBot:
             ), parse_mode="MarkdownV2")
             return True
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout processing command {command} for user {user_id}, target: {locals().get('target_user_id', 'unknown')}")
+            logger.warning(
+                f"Timeout processing command {command} for user {user_id}, target: {locals().get('target_user_id', 'unknown')}")
             if user_id in self.waiting_user_id:
                 del self.waiting_user_id[user_id]
             if user_id in self.pending_request:
@@ -533,7 +585,8 @@ class TelegramBot:
             logger.debug(f"Cleared waiting_user_id and pending_request for user {user_id} due to timeout")
             return True
         except Exception as e:
-            logger.error(f"Error processing interactive user ID for user {user_id}, command: {command}: {str(e)}", exc_info=True)
+            logger.error(f"Error processing interactive user ID for user {user_id}, command: {command}: {str(e)}",
+                         exc_info=True)
             if user_id in self.waiting_user_id:
                 del self.waiting_user_id[user_id]
             if user_id in self.pending_request:
@@ -567,7 +620,8 @@ class TelegramBot:
             user_id = update.effective_user.id if update.effective_user else "unknown"
             logger.error(f"Failed to send error message to user {user_id}: {str(e)}", exc_info=True)
 
-    async def reply_success(self, update: Update, text: str, parse_mode: Optional[str] = None, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    async def reply_success(self, update: Update, text: str, parse_mode: Optional[str] = None,
+                            reply_markup: Optional[InlineKeyboardMarkup] = None):
         try:
             reply_method = await self._get_reply_method(update, is_button=update.callback_query is not None)
             msg = await reply_method(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -590,7 +644,9 @@ class TelegramBot:
         except Exception as e:
             logger.debug(f"Failed to delete message {message_id} in {chat_id}: {str(e)}")
 
-    async def send_admin_notification(self, context: ContextTypes.DEFAULT_TYPE, message: str, user_id: Optional[int] = None, buttons: Optional[List[List[InlineKeyboardButton]]] = None):
+    async def send_admin_notification(self, context: ContextTypes.DEFAULT_TYPE, message: str,
+                                      user_id: Optional[int] = None,
+                                      buttons: Optional[List[List[InlineKeyboardButton]]] = None):
         admin_id = Config.ADMIN_ID
         if user_id == admin_id:
             logger.debug(f"Skipping notification to admin {admin_id} as it matches user_id")
@@ -656,7 +712,7 @@ class TelegramBot:
                 "📝 验证规则：\n"
                 "1️⃣ 回答数学题目，点击下方选项提交答案。\n"
                 "2️⃣ 每题有 3分钟 作答时间，超时将刷新题目 ⏳\n"
-                "3️⃣ 共 3次 尝试机会，答错或超时扣除一次。\n\n"
+                "3️⃣ 共 3次 尝试机会，答错或超时扣除一次。机会用尽自动拉黑\n\n"
                 "❓ 验证题目 ❓\n"
                 f"📌 {verification.question}\n\n"
                 f"⏰ 请在 {Config.VERIFICATION_TIMEOUT // 60}分钟 内作答！\n"
@@ -675,7 +731,8 @@ class TelegramBot:
                 Config.VERIFICATION_TIMEOUT,
                 lambda: asyncio.create_task(self.timeout_verification(user_id))
             )
-            logger.debug(f"Started verification for user {user_id}, question: {verification.question}, message_id: {msg.message_id}")
+            logger.debug(
+                f"Started verification for user {user_id}, question: {verification.question}, message_id: {msg.message_id}")
         except Forbidden:
             logger.warning(f"User {user_id} has blocked the bot")
             await self.db.block_user(user_id, "用户禁用机器人")
@@ -683,7 +740,8 @@ class TelegramBot:
             logger.error(f"Failed to start verification for user {user_id}: {str(e)}", exc_info=True)
             raise
 
-    async def unban_user(self, user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, is_button: bool = False):
+    async def unban_user(self, user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         is_button: bool = False):
         try:
             async with asyncio.timeout(15):
                 user_info = await self.db.get_user_info(user_id)
@@ -716,7 +774,9 @@ class TelegramBot:
                         await self.db.execute(
                             """
                             UPDATE users
-                            SET is_blocked = FALSE, block_reason = NULL, block_time = NULL
+                            SET is_blocked   = FALSE,
+                                block_reason = NULL,
+                                block_time   = NULL
                             WHERE user_id = $1
                             """,
                             (user_id,)
@@ -744,7 +804,9 @@ class TelegramBot:
                         await self.db.execute(
                             """
                             UPDATE users
-                            SET is_blocked = FALSE, block_reason = NULL, block_time = NULL
+                            SET is_blocked   = FALSE,
+                                block_reason = NULL,
+                                block_time   = NULL
                             WHERE user_id = $1
                             """,
                             (user_id,)
@@ -756,16 +818,19 @@ class TelegramBot:
                     logger.debug(f"Cancelled verification timer for user {user_id} during unban")
                 await self.forward_handler.clear_chat_state(update.effective_user.id)
                 reply_method = await self._get_reply_method(update, is_button)
-                msg = await reply_method(Config.MESSAGE_TEMPLATES["telegram_unban_success"].format(user_id=user_id), parse_mode=None)
+                msg = await reply_method(Config.MESSAGE_TEMPLATES["telegram_unban_success"].format(user_id=user_id),
+                                         parse_mode=None)
                 context.user_data['unban_message_id'] = msg.message_id
                 # 添加延迟删除逻辑
                 asyncio.create_task(self.delete_message_later(update.effective_user.id, msg.message_id, 1))
-                logger.debug(f"Admin {update.effective_user.id} unblocked user {user_id}, message {msg.message_id} scheduled for deletion")
+                logger.debug(
+                    f"Admin {update.effective_user.id} unblocked user {user_id}, message {msg.message_id} scheduled for deletion")
                 if is_button and update.callback_query and update.callback_query.message:
                     try:
                         await update.callback_query.message.delete()
                     except Exception as e:
-                        logger.debug(f"Failed to delete callback query message for admin {update.effective_user.id}: {str(e)}")
+                        logger.debug(
+                            f"Failed to delete callback query message for admin {update.effective_user.id}: {str(e)}")
         except asyncio.TimeoutError:
             logger.warning(f"Timeout in unban_user for user {user_id}")
             await self.reply_error(update, "操作超时，请稍后重试")
@@ -781,7 +846,8 @@ class TelegramBot:
                 del self.pending_request[admin_id]
             if admin_id and admin_id in self.waiting_user_id:
                 del self.waiting_user_id[admin_id]
-            logger.debug(f"Cleared pending_request and waiting_user_id for admin {admin_id if admin_id else 'unknown'} in unban_user")
+            logger.debug(
+                f"Cleared pending_request and waiting_user_id for admin {admin_id if admin_id else 'unknown'} in unban_user")
 
     @handle_errors
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -866,16 +932,18 @@ class TelegramBot:
             return
 
         admin_id = query.from_user.id
-        valid_single_actions = ["confirm_clean", "cancel_clean", "reset_chat", "cancel_user_id", 
-                            "request_ban", "request_unban", "request_chat", "list", 
-                            "blacklist", "status", "clean", "count"]
+        valid_single_actions = ["confirm_clean", "cancel_clean", "reset_chat", "cancel_user_id",
+                                "request_ban", "request_unban", "request_chat", "list",
+                                "blacklist", "status", "clean", "count"]
         if "_" not in query.data and query.data not in valid_single_actions:
             logger.warning(f"Invalid callback data format: {query.data} for user {admin_id}")
             await self.reply_error(update, "无效按钮操作，请重试")
             return
 
         if query.data in ["request_ban", "request_unban", "request_chat"]:
-            if admin_id in self.pending_request and self.pending_request[admin_id] in [CommandType.CHAT, CommandType.BAN, CommandType.UNBAN]:
+            if admin_id in self.pending_request and self.pending_request[admin_id] in [CommandType.CHAT,
+                                                                                       CommandType.BAN,
+                                                                                       CommandType.UNBAN]:
                 await self.reply_error(update, "请先完成或取消当前操作（/chat, /ban, 或 /unban）")
                 logger.debug(f"Mutex check failed for button {query.data} by admin {admin_id}")
                 return
@@ -1058,10 +1126,10 @@ class TelegramBot:
 
             await self.db.update_conversation(user.id)
             if await self.db.is_verified(user.id):
-                await self.reply_success(update, 
-                    "🎉 *验证通过！欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊",
-                    parse_mode="MarkdownV2"
-                )
+                await self.reply_success(update,
+                                         "🎉 *验证通过！欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊",
+                                         parse_mode="MarkdownV2"
+                                         )
                 return
 
             verification = await self.db.get_verification(user.id)
@@ -1071,18 +1139,20 @@ class TelegramBot:
                     try:
                         # 检查消息是否仍有效
                         await self.application.bot.get_chat(user.id)  # 确保用户未拉黑机器人
-                        await self.reply_success(update, 
-                            f"您已有正在进行的验证，请完成当前题目！\n剩余尝试次数：*{remaining}/3*",
-                            parse_mode="MarkdownV2"
-                        )
-                        logger.debug(f"Prompted user {user.id} to continue existing verification, message_id={verification.message_id}")
+                        await self.reply_success(update,
+                                                 f"您已有正在进行的验证，请完成当前题目！\n剩余尝试次数：*{remaining}/3*",
+                                                 parse_mode="MarkdownV2"
+                                                 )
+                        logger.debug(
+                            f"Prompted user {user.id} to continue existing verification, message_id={verification.message_id}")
                         return
                     except Forbidden:
                         logger.warning(f"User {user.id} has blocked the bot, blocking user")
                         await self.db.block_user(user.id, "用户禁用机器人")
                         return
                     except BadRequest:
-                        logger.debug(f"Verification message {verification.message_id} for user {user.id} is invalid, resetting")
+                        logger.debug(
+                            f"Verification message {verification.message_id} for user {user.id} is invalid, resetting")
                         verification.message_id = None
                         await self.db.update_verification(verification)
                     except Exception as e:
@@ -1159,7 +1229,8 @@ class TelegramBot:
 
     async def _send_user_list(self, update: Update, users: List[UserInfo], is_blacklist: bool, is_button: bool):
         if not users:
-            message = Config.MESSAGE_TEMPLATES["telegram_blacklist_empty"] if is_blacklist else Config.MESSAGE_TEMPLATES["telegram_list_users_empty"]
+            message = Config.MESSAGE_TEMPLATES["telegram_blacklist_empty"] if is_blacklist else \
+            Config.MESSAGE_TEMPLATES["telegram_list_users_empty"]
             await self.reply_error(update, message, parse_mode=None)
             return
 
@@ -1215,7 +1286,8 @@ class TelegramBot:
             await self._send_user_list(update, users, is_blacklist=False, is_button=is_button)
             logger.info(f"List users command completed for user {update.effective_user.id}")
         except AttributeError as e:
-            logger.error(f"Failed to call _send_user_list in list_users for user {update.effective_user.id}: {str(e)}", exc_info=True)
+            logger.error(f"Failed to call _send_user_list in list_users for user {update.effective_user.id}: {str(e)}",
+                         exc_info=True)
             await self.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_error_generic"])
         except Exception as e:
             logger.error(f"Error in list_users for user {update.effective_user.id}: {str(e)}", exc_info=True)
@@ -1229,7 +1301,8 @@ class TelegramBot:
                 await update.message.delete()
                 logger.debug(f"Deleted /blacklist command message for admin {update.effective_user.id}")
             except Exception as e:
-                logger.debug(f"Failed to delete /blacklist command message for admin {update.effective_user.id}: {str(e)}")
+                logger.debug(
+                    f"Failed to delete /blacklist command message for admin {update.effective_user.id}: {str(e)}")
 
         if not await self._restrict_and_validate(update):
             return
@@ -1238,7 +1311,8 @@ class TelegramBot:
             await self._send_user_list(update, blocked_users, is_blacklist=True, is_button=is_button)
             logger.info(f"Blacklist command completed for user {update.effective_user.id}")
         except AttributeError as e:
-            logger.error(f"Failed to call _send_user_list in blacklist for user {update.effective_user.id}: {str(e)}", exc_info=True)
+            logger.error(f"Failed to call _send_user_list in blacklist for user {update.effective_user.id}: {str(e)}",
+                         exc_info=True)
             await self.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_error_generic"])
         except Exception as e:
             logger.error(f"Error in blacklist for user {update.effective_user.id}: {str(e)}", exc_info=True)
@@ -1305,7 +1379,8 @@ class TelegramBot:
                 reply_markup = None
                 try:
                     logger.debug(f"Fetching current chat info for user {user_id}")
-                    target_user_id, user_info, error_msg = await self.forward_handler.get_current_chat_with_validation(user_id)
+                    target_user_id, user_info, error_msg = await self.forward_handler.get_current_chat_with_validation(
+                        user_id)
                     if user_info and not error_msg:
                         escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
                         current_chat_info = f"[{escaped_nickname}](tg://user?id={user_info.user_id})"

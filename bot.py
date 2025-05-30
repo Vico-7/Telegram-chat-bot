@@ -64,15 +64,9 @@ class BotApplication:
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self.bot = TelegramBot(self.db, self.application)
-        try:
-            import forward_message
-            logger.debug(f"ForwardMessageHandler module: {forward_message.__file__}")
-            self.forward_handler = ForwardMessageHandler(self.db, self.application, self.bot)
-            self.bot.set_forward_handler(self.forward_handler)
-            logger.debug("ForwardMessageHandler initialized and set for TelegramBot")
-        except Exception as e:
-            logger.error(f"Failed to initialize ForwardMessageHandler: {str(e)}", exc_info=True)
-            self.forward_handler = None
+        self.forward_handler = ForwardMessageHandler(self.db, self.application)
+        self.bot.set_forward_handler(self.forward_handler)
+        logger.debug("ForwardMessageHandler initialized and set for TelegramBot")
 
         logger.info(Config.MESSAGE_TEMPLATES["app_initialized"])
 

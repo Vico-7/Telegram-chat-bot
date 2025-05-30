@@ -282,12 +282,19 @@ class Database:
                 await self.execute(
                     """
                     UPDATE users
-                    SET is_blocked = FALSE, block_reason = NULL, block_time = NULL
+                    SET is_blocked   = FALSE,
+                        block_reason = NULL,
+                        block_time   = NULL
                     WHERE user_id = $1
                     """,
                     (user_id,)
                 )
-                logger.debug(f"User {user_id} unblocked, verification state reset to default")
+                # 清除对话记录（确保不影响管理员的当前对话目标）
+                await self.execute(
+                    "DELETE FROM conversations WHERE user_id = $1",
+                    (user_id,)
+                )
+                logger.info(f"User {user_id} unblocked, verification and conversation state reset")
             except Exception as e:
                 logger.error(f"Error unblocking user {user_id}: {str(e)}", exc_info=True)
                 raise
