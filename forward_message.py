@@ -21,7 +21,8 @@ class ForwardMessageHandler:
         self.escape_markdown_v2 = escape_func
         logger.debug("escape_markdown_v2 set for ForwardMessageHandler")
 
-    async def _get_reply_method(self, update: Update, context: ContextTypes.DEFAULT_TYPE, is_button: bool, default_chat_id: int):
+    @staticmethod
+    async def _get_reply_method(update: Update, context: ContextTypes.DEFAULT_TYPE, is_button: bool, default_chat_id: int):
         if is_button and update.callback_query and update.callback_query.message:
             return update.callback_query.message.reply_text
         elif update.message:
