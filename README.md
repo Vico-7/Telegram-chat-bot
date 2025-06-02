@@ -76,5 +76,5 @@
 
 2. **参考部署文档**：
    - 按照以下文档完成部署：
-   - 部署文档：[hhh.sonnet.cv](https://hhh.sonnet.cv)
+   - [部署文档](https://blog.sonnet.cv/2025/06/03/telegram-chat-bot)
 
