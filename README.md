@@ -4,7 +4,7 @@
 为应对 Telegram 私信骚扰问题，初期采用不设置用户名并结合私信机器人的方式屏蔽骚扰。Telegram 推出<span style="color: #e74c3c;">付费私信功能</span>后，启用该功能并设置用户名，同时提供机器人供陌生人使用。然而，诈骗和骚扰信息仍通过机器人发送，因此开发本机器人以进一步提升<span style="color: #e74c3c;">防护能力</span>。
 
 ## 功能概述
-本机器人基于 <span style="color: #e74c3c;">Telegram Webhook API</span> 构建，部署于私有服务器，数据存储在私有数据库中，具备<span style="color: #e74c3c;">高实时性、高效性和安全性</span>。操作设计以用户友好为核心，大多数功能可通过点击完成。通过 `getWebhookInfo` API 查看机器人待处理更新和 Webhook 服务器 IP。以 ID 为标识符设定对话目标，管理员设定目标后可直接发送消息，无需手动回复，支持几乎所有类型的消息。
+本机器人基于<span style="color: #e74c3c;">Telegram Webhook API</span>构建，部署于私有服务器，数据存储在私有数据库中，具备<span style="color: #e74c3c;">高实时性、高效性和安全性</span>。操作设计以用户友好为核心，大多数功能可通过点击完成。通过 `getWebhookInfo` API 查看机器人待处理更新和 Webhook 服务器 IP。以 ID 为标识符设定对话目标，管理员设定目标后可直接发送消息，无需手动回复，支持几乎所有类型的消息。
 
 ### 人机验证
 - **高难度验证机制**：
@@ -50,7 +50,7 @@
   | <img src="https://github.com/user-attachments/assets/6aee052c-1237-42df-83f8-3204f9c154b1" alt="指令快捷方式" width="300" /> |
 
 ### 操作友好
-为提升操作便捷性，几乎所有场景均集成 <span style="color: #e74c3c;">Inline Keyboard</span> 功能：
+为提升操作便捷性，几乎所有场景均集成<span style="color: #e74c3c;">Inline Keyboard</span>功能：
 - **验证通过后**：提供快捷拉黑和切换对话按钮。
 - **黑名单管理**：列出的黑名单用户支持<span style="color: #e74c3c;">一键解除拉黑或重新拉黑</span>。
 - **拉黑通知**：拉黑成功通知附带解除拉黑按键，方便快速操作。
@@ -63,8 +63,18 @@
 ### 前置准备
 为确保部署顺利，请提前准备以下内容：
 - <span style="color: #e74c3c;">一台安装了 1panel 的服务器</span>：用于托管和管理机器人服务。
-- <span style="color: #e74c3c;">一个域名</span>：用于配置 Webhook 和访问服务。
+- <span style="color: #e74c3c;">一个域名</span>：添加一条指向你的服务器IP的A记录，用于配置 Webhook 和访问服务。
 
 ### 部署步骤
-请参考以下文档完成部署：
-- <span style="color: #e74c3c;">部署文档</span>：[hhh.sonnet.cv](https://hhh.sonnet.cv)
+1. **下载源代码**：
+   - 获取项目源代码以进行部署。
+   - **示例截图**：
+     
+     | 源代码下载界面 |
+     | :-------------: |
+     | <img src="https://github.com/user-attachments/assets/9c1d5d48-87f4-4d83-8020-e12ef141eade" alt="源代码下载" width="300" /> |
+
+2. **参考部署文档**：
+   - 按照以下文档完成部署：
+   - <span style="color: #e74c3c;">部署文档</span>：[hhh.sonnet.cv](https://hhh.sonnet.cv)
+
