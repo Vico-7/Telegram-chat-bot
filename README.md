@@ -63,7 +63,7 @@
 ### 前置准备
 为确保部署顺利，请提前准备以下内容：
 - <span style="color: #e74c3c;">一台安装了 1panel 的服务器</span>：用于托管和管理机器人服务。
-- <span style="color: #e74c3c;">一个域名</span>：添加一条指向你的服务器IP的A记录，用于配置 Webhook 和访问服务。
+- <span style="color: #e74c3c;">一个域名</span>：添加一条指向你的服务器IP的A记录，用于配置 Webhook 和访问服务。（Webhook不支持ipv6）
 
 ### 部署步骤
 1. **下载源代码**：
