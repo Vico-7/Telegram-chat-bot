@@ -510,7 +510,8 @@ class TelegramBot:
         if await self.db.is_blocked(user_id):
             await self.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_blocked"])
             return False
-        if not await self.db.is_verified(user_id):
+        verification_enabled = await self.db.get_verification_enabled()
+        if verification_enabled and not await self.db.is_verified(user_id):
             await self.reply_error(update, "请先完成人机验证，使用 /start 开始")
             return False
         return True
@@ -691,6 +692,12 @@ class TelegramBot:
             await self.ban_handler.handle_verification_failure(user_id, verification, reason="timeout")
 
     async def start_verification(self, user_id: int, verification: Verification):
+        verification_enabled = await self.db.get_verification_enabled()
+        if not verification_enabled:
+            logger.debug(f"Verification disabled, skipping verification for user {user_id}")
+            await self.db.verify_user(user_id)  # 直接标记为已验证
+            return
+
         remaining = 3 - verification.error_count
         if remaining <= 0:
             logger.debug(f"Max verification attempts reached for user {user_id}")
@@ -732,7 +739,7 @@ class TelegramBot:
                 lambda: asyncio.create_task(self.timeout_verification(user_id))
             )
             logger.debug(
-                f"Started verification for user {user_id}, question: {verification.question}, message_id: {msg.message_id}")
+                f"Started verification for user {user_id}, question: {verification.question}, message_id={msg.message_id}")
         except Forbidden:
             logger.warning(f"User {user_id} has blocked the bot")
             await self.db.block_user(user_id, "用户禁用机器人")
@@ -876,15 +883,17 @@ class TelegramBot:
                     await self.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_user_blocked"])
                     return
 
-                if not await self.db.is_verified(user_id):
-                    logger.debug(f"User {user_id} is not verified, deleting message and prompting for verification")
-                    try:
-                        await message.delete()
-                        logger.debug(f"Deleted message from unverified user {user_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete message from unverified user {user_id}: {str(e)}")
-                    await self.reply_error(update, "请先完成人机验证，使用 /start 开始")
-                    return
+                verification_enabled = await self.db.get_verification_enabled()
+                if verification_enabled:  # 仅当验证开启时检查验证状态
+                    if not await self.db.is_verified(user_id):
+                        logger.debug(f"User {user_id} is not verified, deleting message and prompting for verification")
+                        try:
+                            await message.delete()
+                            logger.debug(f"Deleted message from unverified user {user_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete message from unverified user {user_id}: {str(e)}")
+                        await self.reply_error(update, "请先完成人机验证，使用 /start 开始")
+                        return
 
         await self.forward_handler.forward_message(update, context)
 
@@ -934,7 +943,7 @@ class TelegramBot:
         admin_id = query.from_user.id
         valid_single_actions = ["confirm_clean", "cancel_clean", "reset_chat", "cancel_user_id",
                                 "request_ban", "request_unban", "request_chat", "list",
-                                "blacklist", "status", "clean", "count"]
+                                "blacklist", "status", "clean", "count", "toggle_verify"]
         if "_" not in query.data and query.data not in valid_single_actions:
             logger.warning(f"Invalid callback data format: {query.data} for user {admin_id}")
             await self.reply_error(update, "无效按钮操作，请重试")
@@ -942,15 +951,70 @@ class TelegramBot:
 
         if query.data in ["request_ban", "request_unban", "request_chat"]:
             if admin_id in self.pending_request and self.pending_request[admin_id] in [CommandType.CHAT,
-                                                                                       CommandType.BAN,
-                                                                                       CommandType.UNBAN]:
+                                                                                    CommandType.BAN,
+                                                                                    CommandType.UNBAN]:
                 await self.reply_error(update, "请先完成或取消当前操作（/chat, /ban, 或 /unban）")
                 logger.debug(f"Mutex check failed for button {query.data} by admin {admin_id}")
                 return
             logger.debug(f"Mutex check passed for button {query.data} by admin {admin_id}")
 
         try:
-            if query.data == "confirm_clean":
+            if query.data == "toggle_verify":
+                current_state = await self.db.get_verification_enabled()
+                new_state = not current_state
+                await self.db.set_verification_enabled(new_state)
+                # 消息文本显示当前状态（new_state）
+                verification_status = "开启" if new_state else "关闭"
+                # 按钮文本显示相反的动作（与new_state相反）
+                new_button_text = "关闭验证" if new_state else "开启验证"
+                buttons = [
+                    [
+                        InlineKeyboardButton("🚫 拉黑", callback_data="request_ban"),
+                        InlineKeyboardButton("✅ 解禁", callback_data="request_unban")
+                    ],
+                    [
+                        InlineKeyboardButton("💬 对话", callback_data="request_chat"),
+                        InlineKeyboardButton("📋 用户", callback_data="list")
+                    ],
+                    [
+                        InlineKeyboardButton("🛑 黑名单", callback_data="blacklist"),
+                        InlineKeyboardButton("📡 状态", callback_data="status")
+                    ],
+                    [
+                        InlineKeyboardButton("🗑️ 清除", callback_data="clean"),
+                        InlineKeyboardButton("📈 统计", callback_data="count")
+                    ],
+                    [
+                        InlineKeyboardButton(new_button_text, callback_data="toggle_verify")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(buttons)
+                # 动态消息文本，包含当前验证状态
+                message_text = (
+                    f"👋 *管理员，您好！* 👋\n\n"
+                    f"当前验证状态：*{verification_status}*\n"
+                    f"使用下方按钮管理用户和对话："
+                )
+                try:
+                    await query.message.edit_text(
+                        message_text,
+                        reply_markup=reply_markup,
+                        parse_mode="MarkdownV2"
+                    )
+                except BadRequest as e:
+                    if "Message is not modified" in str(e):
+                        logger.warning(f"Message not modified for toggle_verify, forcing update for user {admin_id}")
+                        # 强制发送新消息
+                        await query.message.delete()
+                        await query.message.chat.send_message(
+                            message_text,
+                            reply_markup=reply_markup,
+                            parse_mode="MarkdownV2"
+                        )
+                    else:
+                        raise
+                logger.info(f"Admin {admin_id} toggled verification enabled to {new_state}")
+            elif query.data == "confirm_clean":
                 async with self.db.transaction():
                     await self.db.clean_database()
                 await self.reply_success(update, Config.MESSAGE_TEMPLATES["telegram_clean_success"], parse_mode=None)
@@ -1087,6 +1151,8 @@ class TelegramBot:
             return
 
         if user.id == Config.ADMIN_ID:
+            verification_enabled = await self.db.get_verification_enabled()
+            verify_button_text = "关闭验证" if verification_enabled else "开启验证"
             buttons = [
                 [
                     InlineKeyboardButton("🚫 拉黑", callback_data="request_ban"),
@@ -1103,6 +1169,9 @@ class TelegramBot:
                 [
                     InlineKeyboardButton("🗑️ 清除", callback_data="clean"),
                     InlineKeyboardButton("📈 统计", callback_data="count")
+                ],
+                [
+                    InlineKeyboardButton(verify_button_text, callback_data="toggle_verify")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(buttons)
@@ -1115,7 +1184,9 @@ class TelegramBot:
 
         async with self.db.transaction():
             user_info = await self.db.get_user_info(user.id)
+            is_new_user = False
             if not user_info:
+                is_new_user = True
                 user_info = UserInfo(
                     user_id=user.id,
                     nickname=user.full_name,
@@ -1125,11 +1196,34 @@ class TelegramBot:
                 await self.db.add_user(user_info)
 
             await self.db.update_conversation(user.id)
+            verification_enabled = await self.db.get_verification_enabled()
+
+            if not verification_enabled:
+                # 验证关闭时，发送欢迎消息
+                message = "🎉 *验证已关闭，欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊"
+                await self.reply_success(update, message, parse_mode="MarkdownV2")
+
+                # 仅对新用户（首次注册）发送管理员通知
+                if is_new_user:
+                    notification_message = f"用户启动机器人:\n{UserInfo.format(user_info, blocked=False)}"
+                    buttons = [
+                        [
+                            InlineKeyboardButton("🚫 拉黑", callback_data=f"confirm_ban_{user.id}"),
+                            InlineKeyboardButton("💬 切换对话", callback_data=f"cb_switch_{user.id}")
+                        ]
+                    ]
+                    await self.send_admin_notification(
+                        context=context,
+                        message=notification_message,
+                        user_id=user.id,
+                        buttons=buttons
+                    )
+                return
+
+            # 验证开启时的现有逻辑
             if await self.db.is_verified(user.id):
-                await self.reply_success(update,
-                                         "🎉 *验证通过！欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊",
-                                         parse_mode="MarkdownV2"
-                                         )
+                message = "🎉 *欢迎使用！* 🎉\n\n您可以开始与管理员对话了！😊"
+                await self.reply_success(update, message, parse_mode="MarkdownV2")
                 return
 
             verification = await self.db.get_verification(user.id)
@@ -1140,9 +1234,9 @@ class TelegramBot:
                         # 检查消息是否仍有效
                         await self.application.bot.get_chat(user.id)  # 确保用户未拉黑机器人
                         await self.reply_success(update,
-                                                 f"您已有正在进行的验证，请完成当前题目！\n剩余尝试次数：*{remaining}/3*",
-                                                 parse_mode="MarkdownV2"
-                                                 )
+                                                f"您已有正在进行的验证，请完成当前题目！\n剩余尝试次数：*{remaining}/3*",
+                                                parse_mode="MarkdownV2"
+                                                )
                         logger.debug(
                             f"Prompted user {user.id} to continue existing verification, message_id={verification.message_id}")
                         return
@@ -1439,6 +1533,31 @@ class TelegramBot:
         reply_method = await self._get_reply_method(update, is_button)
         await reply_method(warning_message, reply_markup=reply_markup, parse_mode="MarkdownV2")
 
+
+    @handle_errors
+    async def verify(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # 删除指令消息
+        if update.message:
+            try:
+                await update.message.delete()
+                logger.debug(f"Deleted /verify command message for admin {update.effective_user.id}")
+            except Exception as e:
+                logger.debug(f"Failed to delete /verify command message for admin {update.effective_user.id}: {str(e)}")
+
+        if not await self._restrict_and_validate(update):
+            return
+
+        try:
+            current_state = await self.db.get_verification_enabled()
+            new_state = not current_state
+            await self.db.set_verification_enabled(new_state)
+            message = f"已{'开启' if new_state else '关闭'}人机验证"
+            await self.reply_success(update, message, parse_mode=None)
+            logger.info(f"Admin {update.effective_user.id} set verification enabled to {new_state}")
+        except Exception as e:
+            logger.error(f"Error toggling verification enabled for admin {update.effective_user.id}: {str(e)}", exc_info=True)
+            await self.reply_error(update, Config.MESSAGE_TEMPLATES["telegram_error_generic"])
+
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(context.error) if context.error else "Unknown error"
         logger.error(f"Update {update} caused error: {error_msg}", exc_info=True)
@@ -1458,7 +1577,8 @@ class TelegramBot:
             BotCommand("blacklist", "列出黑名单"),
             BotCommand("status", "查看机器人状态和当前对话目标"),
             BotCommand("clean", "清除数据库"),
-            BotCommand("count", "查看用户统计信息")
+            BotCommand("count", "查看用户统计信息"),
+            BotCommand("verify", "开启/关闭人机验证")  # 新增 verify 命令
         ]
         user_commands = [
             BotCommand("start", "使用机器人")

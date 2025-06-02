@@ -55,11 +55,6 @@ class ForwardMessageHandler:
                         logger.warning(f"User {target_user_id} is blocked for admin {admin_id}, clearing chat state")
                         await self.clear_chat_state(admin_id)
                         return None, None, "用户已拉黑"
-                    if not await self.db.is_verified(target_user_id):
-                        logger.warning(
-                            f"User {target_user_id} is not verified for admin {admin_id}, clearing chat state")
-                        await self.clear_chat_state(admin_id)
-                        return None, None, "用户未验证"
                     logger.debug(f"Validated chat target {target_user_id} for admin {admin_id}")
                     return target_user_id, user_info, None
         except asyncio.TimeoutError:
@@ -131,37 +126,39 @@ class ForwardMessageHandler:
                 logger.debug(f"User {user.id} is blocked, rejecting message")
                 await message.reply_text("您已被拉黑，无法使用机器人", parse_mode=None)
                 return
-            is_verified = await self.db.is_verified(user.id)
-            logger.debug(f"Verification check for user {user.id}: is_verified={is_verified}")
-            if not is_verified:
-                logger.debug(f"User {user.id} is not verified, deleting message and prompting for verification")
-                try:
-                    await message.delete()
-                    logger.debug(f"Deleted message from unverified user {user.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete message from unverified user {user.id}: {str(e)}")
-                await self.application.bot_data['bot'].reply_error(update, "请先完成人机验证，使用 /start 开始")
-                return
+            verification_enabled = await self.db.get_verification_enabled()
+            if verification_enabled:  # 仅当验证开启时检查验证状态
+                is_verified = await self.db.is_verified(user.id)
+                logger.debug(f"Verification check for user {user.id}: is_verified={is_verified}")
+                if not is_verified:
+                    logger.debug(f"User {user.id} is not verified, deleting message and prompting for verification")
+                    try:
+                        await message.delete()
+                        logger.debug(f"Deleted message from unverified user {user.id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete message from unverified user {user.id}: {str(e)}")
+                    await self.application.bot_data['bot'].reply_error(update, "请先完成人机验证，使用 /start 开始")
+                    return
 
             await self.db.update_conversation(user.id)
             logger.debug(f"Updated conversation for user {user.id}")
 
-        try:
-            # 直接转发消息给管理员
-            admin_id = Config.ADMIN_ID
-            await self.application.bot.forward_message(
-                chat_id=admin_id,
-                from_chat_id=message.chat_id,
-                message_id=message.message_id
-            )
-            await self.application.bot_data['bot'].send_temp_message(message.chat_id, "消息已转发")
-            logger.info(f"Message forwarded from user {user.id} to admin {admin_id}, type: {message_type}")
-        except Forbidden:
-            logger.warning(f"Cannot forward message to admin {admin_id}: Admin has blocked the bot")
-            await message.reply_text("无法转发消息：管理员不可用", parse_mode=None)
-        except Exception as e:
-            logger.error(f"Failed to forward message to admin {admin_id}: {str(e)}", exc_info=True)
-            await message.reply_text("无法转发消息，请稍后再试", parse_mode=None)
+            try:
+                # 直接转发消息给管理员
+                admin_id = Config.ADMIN_ID
+                await self.application.bot.forward_message(
+                    chat_id=admin_id,
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id
+                )
+                await self.application.bot_data['bot'].send_temp_message(message.chat_id, "消息已转发")
+                logger.info(f"Message forwarded from user {user.id} to admin {admin_id}, type: {message_type}")
+            except Forbidden:
+                logger.warning(f"Cannot forward message to admin {admin_id}: Admin has blocked the bot")
+                await message.reply_text("无法转发消息：管理员不可用", parse_mode=None)
+            except Exception as e:
+                logger.error(f"Failed to forward message to admin {admin_id}: {str(e)}", exc_info=True)
+                await message.reply_text("无法转发消息，请稍后再试", parse_mode=None)
 
     async def switch_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int,
                         is_button: bool = False):
@@ -187,10 +184,6 @@ class ForwardMessageHandler:
                     if user_info.is_blocked:
                         await reply_method("无法切换：用户已拉黑", parse_mode=None)
                         logger.warning(f"User {user_id} is blocked for admin {admin_id}")
-                        return
-                    if not await self.db.is_verified(user_id):
-                        await reply_method("无法切换：用户未验证", parse_mode=None)
-                        logger.warning(f"User {user_id} is not verified for admin {admin_id}")
                         return
         except asyncio.TimeoutError:
             await reply_method("操作超时，请稍后再试", parse_mode=None)

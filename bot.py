@@ -80,6 +80,7 @@ class BotApplication:
             CommandHandler("clean", self.bot.clean),
             CommandHandler("chat", self.bot.chat),
             CommandHandler("count", self.bot.count),
+            CommandHandler("verify", self.bot.verify),  # 新增 verify 命令处理器
             MessageHandler(filters.ALL & ~filters.COMMAND, self.bot.handle_message),
             MessageHandler(
                 filters.ALL & ~filters.COMMAND & filters.User(user_id=Config.ADMIN_ID) & filters.REPLY,

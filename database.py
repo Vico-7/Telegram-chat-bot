@@ -48,6 +48,7 @@ class UserInfo:
         )
         if blocked and user.block_time:
             info += f"\n拉黑时间: {user.block_time.astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')} UTC+8"
+            info += f"\n拉黑原因: {user.block_reason or '无'}"
         return info
 
 @dataclass
@@ -65,154 +66,192 @@ class Verification:
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
-            else:
-                logger.debug(f"忽略无效字段更新: {key}")
-
-class ConnectionContext:
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
-        self.conn: Optional[asyncpg.Connection] = None
-
-    async def __aenter__(self) -> asyncpg.Connection:
-        self.conn = await self.pool.acquire()
-        return self.conn
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.conn:
-            await self.pool.release(self.conn)
 
 class Database:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
 
     async def initialize(self):
+        """初始化数据库连接池并创建表结构。"""
         if self.pool:
             logger.info(MESSAGE_TEMPLATES["db_already_initialized"])
             await self.close()
         try:
+            # 优化：设置连接超时和命令超时
             self.pool = await asyncpg.create_pool(
                 min_size=Config.POOL_MIN,
                 max_size=Config.POOL_MAX,
+                command_timeout=10,  # 每个命令最大执行时间10秒
+                server_settings={"tcp_keepalives_idle": "300"},  # 优化TCP连接保持
                 **Config.DB_CONFIG
             )
             await self._init_tables()
             logger.info(MESSAGE_TEMPLATES["db_initialized"])
         except asyncpg.exceptions.ConnectionFailureError as e:
-            logger.error(MESSAGE_TEMPLATES["db_connection_failed"].format(error=str(e)), exc_info=True)
+            logger.error(MESSAGE_TEMPLATES["db_connection_failed"].format(error=str(e)))
             raise
         except Exception as e:
-            logger.error(MESSAGE_TEMPLATES["db_init_failed"].format(error=str(e)), exc_info=True)
+            logger.error(MESSAGE_TEMPLATES["db_init_failed"].format(error=str(e)))
             raise
 
     async def close(self):
+        """关闭数据库连接池。"""
         if self.pool:
             await self.pool.close()
             self.pool = None
             logger.info(MESSAGE_TEMPLATES["db_closed"])
 
     async def _init_tables(self):
+        """初始化数据库表结构和索引。"""
         async with self._acquire_connection() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    nickname TEXT NOT NULL,
-                    username TEXT,
-                    registration_time TIMESTAMP NOT NULL,
-                    is_blocked BOOLEAN DEFAULT FALSE,
-                    block_reason TEXT,
-                    block_time TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS verification (
-                    user_id BIGINT PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer FLOAT NOT NULL,
-                    options FLOAT[] NOT NULL CHECK (array_length(options, 1) = 4),
-                    verified BOOLEAN DEFAULT FALSE,
-                    verification_time TIMESTAMP NOT NULL,
-                    error_count INTEGER NOT NULL DEFAULT 0,
-                    message_id BIGINT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    user_id BIGINT PRIMARY KEY,
-                    last_message_time TIMESTAMP NOT NULL
-                )
-            """)
-            # 添加索引
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_users_is_blocked ON users (is_blocked);
-                CREATE INDEX IF NOT EXISTS idx_verification_verified ON verification (verified);
-                CREATE INDEX IF NOT EXISTS idx_conversations_last_message_time ON conversations (last_message_time);
-            """)
-            try:
+            # 优化：使用单一事务执行所有表创建和索引操作
+            async with conn.transaction():
+                # 创建 users 表
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        nickname TEXT NOT NULL,
+                        username TEXT,
+                        registration_time TIMESTAMP NOT NULL,
+                        is_blocked BOOLEAN DEFAULT FALSE,
+                        block_reason TEXT,
+                        block_time TIMESTAMP
+                    )
+                """)
+                # 创建 verification 表
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS verification (
+                        user_id BIGINT PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        answer FLOAT NOT NULL,
+                        options FLOAT[] NOT NULL CHECK (array_length(options, 1) = 4),
+                        verified BOOLEAN DEFAULT FALSE,
+                        verification_time TIMESTAMP NOT NULL,
+                        error_count INTEGER NOT NULL DEFAULT 0,
+                        message_id BIGINT
+                    )
+                """)
+                # 创建 conversations 表
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        user_id BIGINT PRIMARY KEY,
+                        last_message_time TIMESTAMP NOT NULL
+                    )
+                """)
+                # 创建 settings 表
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        setting_key TEXT PRIMARY KEY,
+                        setting_value BOOLEAN NOT NULL
+                    )
+                """)
+                # 创建索引
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_users_is_blocked ON users (is_blocked);
+                    CREATE INDEX IF NOT EXISTS idx_verification_verified ON verification (verified);
+                    CREATE INDEX IF NOT EXISTS idx_conversations_last_message_time ON conversations (last_message_time);
+                """)
+                # 更新 schema
+                await conn.execute("""
+                    ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS block_reason TEXT,
+                    ADD COLUMN IF NOT EXISTS block_time TIMESTAMP
+                """)
                 await conn.execute("""
                     ALTER TABLE verification
                     ADD COLUMN IF NOT EXISTS message_id BIGINT
                 """)
-                logger.debug(MESSAGE_TEMPLATES["db_schema_updated"])
-            except Exception as e:
-                logger.debug(MESSAGE_TEMPLATES["db_schema_update_failed"].format(error=str(e)))
+                # 初始化验证开关状态
+                await conn.execute("""
+                    INSERT INTO settings (setting_key, setting_value)
+                    VALUES ('verification_enabled', TRUE)
+                    ON CONFLICT (setting_key) DO NOTHING
+                """)
+            logger.debug(MESSAGE_TEMPLATES["db_schema_updated"])
 
-    def _normalize_datetime(self, dt: datetime.datetime) -> datetime.datetime:
+    async def get_verification_enabled(self) -> bool:
+        """获取人机验证开关状态，默认开启。"""
+        try:
+            result = await self.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = $1",
+                "verification_enabled",
+                fetch="val"
+            )
+            return bool(result) if result is not None else True
+        except Exception as e:
+            logger.error(f"获取验证开关状态失败: {str(e)}")
+            return True
+
+    async def set_verification_enabled(self, enabled: bool):
+        """设置人机验证开关状态。"""
+        try:
+            await self.execute(
+                """
+                INSERT INTO settings (setting_key, setting_value)
+                VALUES ($1, $2)
+                ON CONFLICT (setting_key) DO UPDATE
+                SET setting_value = EXCLUDED.setting_value
+                """,
+                ("verification_enabled", enabled)
+            )
+            logger.debug(f"验证开关设置为 {enabled}")
+        except Exception as e:
+            logger.error(f"设置验证开关失败: {str(e)}")
+            raise
+
+    @staticmethod
+    def _normalize_datetime(dt: datetime.datetime) -> datetime.datetime:
+        """规范化时间格式为UTC无时区信息。"""
         return dt.astimezone(pytz.UTC).replace(tzinfo=None) if dt.tzinfo else dt
 
     def _validate_params(self, params: Any) -> Tuple:
+        """验证和规范化查询参数。"""
         if not isinstance(params, tuple):
             params = (params,)
         return tuple(self._normalize_datetime(p) if isinstance(p, datetime.datetime) else p for p in params)
 
-    def _sanitize_params(self, params: Tuple) -> str:
-        return str([p if not isinstance(p, str) else "[redacted]" for p in params])
-
-    def _acquire_connection(self) -> ConnectionContext:
+    def _acquire_connection(self) -> asyncpg.Connection:
+        """获取数据库连接。"""
         if not self.pool:
             raise RuntimeError(MESSAGE_TEMPLATES["db_not_initialized"])
-        return ConnectionContext(self.pool)
+        return self.pool.acquire()
 
     async def execute(self, query: str, params: Any = (), fetch: Optional[str] = None, retries: int = 3, delay: float = 0.5) -> Any:
+        """执行数据库查询，支持重试机制。"""
+        params = self._validate_params(params)
         for attempt in range(retries):
             async with self._acquire_connection() as conn:
                 try:
-                    normalized_params = self._validate_params(params)
-                    logger.debug(f"执行查询: {query}", extra={"params": self._sanitize_params(normalized_params)})
                     if fetch == "one":
-                        return await conn.fetchrow(query, *normalized_params)
+                        return await conn.fetchrow(query, *params)
                     elif fetch == "all":
-                        return await conn.fetch(query, *normalized_params)
+                        return await conn.fetch(query, *params)
                     elif fetch == "val":
-                        return await conn.fetchval(query, *normalized_params)
-                    await conn.execute(query, *normalized_params)
+                        return await conn.fetchval(query, *params)
+                    await conn.execute(query, *params)
                     return
                 except asyncpg.exceptions.DeadlockDetectedError as e:
-                    logger.warning(f"死锁检测到，重试 {attempt + 1}/{retries}: {str(e)}")
                     if attempt < retries - 1:
-                        await asyncio.sleep(delay * (2 ** attempt))  # 指数退避
-                    else:
-                        logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)), exc_info=True)
-                        raise
+                        await asyncio.sleep(delay * (2 ** attempt))
+                        continue
+                    logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)))
+                    raise
                 except asyncpg.exceptions.PostgresError as e:
-                    logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)), exc_info=True)
+                    logger.error(MESSAGE_TEMPLATES["db_query_failed"].format(error=str(e)))
                     raise
                 except Exception as e:
-                    logger.error(MESSAGE_TEMPLATES["db_unexpected_error"].format(error=str(e)), exc_info=True)
+                    logger.error(MESSAGE_TEMPLATES["db_unexpected_error"].format(error=str(e)))
                     raise
 
     @asynccontextmanager
     async def transaction(self):
+        """事务上下文管理器。"""
         async with self._acquire_connection() as conn:
-            transaction = conn.transaction()
-            await transaction.start()
-            try:
+            async with conn.transaction():
                 yield conn
-                await transaction.commit()
-            except Exception:
-                await transaction.rollback()
-                raise
 
     async def add_user(self, user: UserInfo):
+        """添加或更新用户信息。"""
         if not isinstance(user.user_id, int) or not user.nickname:
             raise ValueError(MESSAGE_TEMPLATES["invalid_user_data"])
         await self.execute(
@@ -226,16 +265,18 @@ class Database:
         )
 
     async def block_user(self, user_id: int, reason: str):
+        """拉黑用户并重置验证状态。"""
         if not isinstance(user_id, int) or not reason:
             raise ValueError(MESSAGE_TEMPLATES["invalid_block_data"])
         async with self.transaction():
+            now = self._normalize_datetime(datetime.datetime.now(BEIJING_TZ))
             await self.execute(
                 """
                 UPDATE users
                 SET is_blocked = TRUE, block_reason = $1, block_time = $2
                 WHERE user_id = $3
                 """,
-                (reason[:255], self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)), user_id)
+                (reason[:255], now, user_id)
             )
             await self.execute(
                 """
@@ -243,79 +284,72 @@ class Database:
                 SET verified = FALSE, error_count = 0, message_id = NULL
                 WHERE user_id = $1
                 """,
-                (user_id,)
+                user_id
             )
-            logger.debug(f"User {user_id} blocked, verification state reset")
+            logger.debug(f"用户 {user_id} 已拉黑，验证状态已重置")
 
     async def unblock_user(self, user_id: int):
+        """解除用户拉黑状态并重置验证和对话记录。"""
         if not isinstance(user_id, int):
             raise ValueError(MESSAGE_TEMPLATES["invalid_block_data"])
         async with self.transaction():
-            try:
-                # 检查用户是否存在
-                user_exists = await self.execute(
-                    "SELECT 1 FROM users WHERE user_id = $1",
-                    (user_id,),
-                    fetch="val"
-                )
-                if not user_exists:
-                    logger.error(f"Cannot unblock user {user_id}: User does not exist")
-                    raise ValueError("用户不存在")
-                # 清除现有验证记录
-                await self.execute(
-                    "DELETE FROM verification WHERE user_id = $1",
-                    (user_id,)
-                )
-                # 插入新的默认验证记录
-                verification = Verification(
-                    user_id=user_id,
-                    question="",
-                    answer=0.0,
-                    options=[],
-                    verified=False,
-                    verification_time=self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)),
-                    error_count=0,
-                    message_id=None
-                )
-                await self.add_verification(verification)
-                # 更新用户拉黑状态
-                await self.execute(
-                    """
-                    UPDATE users
-                    SET is_blocked   = FALSE,
-                        block_reason = NULL,
-                        block_time   = NULL
-                    WHERE user_id = $1
-                    """,
-                    (user_id,)
-                )
-                # 清除对话记录（确保不影响管理员的当前对话目标）
-                await self.execute(
-                    "DELETE FROM conversations WHERE user_id = $1",
-                    (user_id,)
-                )
-                logger.info(f"User {user_id} unblocked, verification and conversation state reset")
-            except Exception as e:
-                logger.error(f"Error unblocking user {user_id}: {str(e)}", exc_info=True)
-                raise
+            user_exists = await self.execute(
+                "SELECT 1 FROM users WHERE user_id = $1",
+                user_id,
+                fetch="val"
+            )
+            if not user_exists:
+                logger.error(f"无法解除拉黑，用户 {user_id} 不存在")
+                raise ValueError("用户不存在")
+            await self.execute(
+                "DELETE FROM verification WHERE user_id = $1",
+                user_id
+            )
+            verification = Verification(
+                user_id=user_id,
+                question="",
+                answer=0.0,
+                options=[],
+                verified=False,
+                verification_time=self._normalize_datetime(datetime.datetime.now(BEIJING_TZ)),
+                error_count=0,
+                message_id=None
+            )
+            await self.add_verification(verification)
+            await self.execute(
+                """
+                UPDATE users
+                SET is_blocked = FALSE, block_reason = NULL, block_time = NULL
+                WHERE user_id = $1
+                """,
+                user_id
+            )
+            await self.execute(
+                "DELETE FROM conversations WHERE user_id = $1",
+                user_id
+            )
+            logger.info(f"用户 {user_id} 已解除拉黑，验证和对话状态已重置")
 
     async def is_blocked(self, user_id: int) -> bool:
+        """检查用户是否被拉黑。"""
         result = await self.execute(
             "SELECT is_blocked FROM users WHERE user_id = $1",
-            (user_id,),
+            user_id,
             fetch="val"
         )
         return bool(result)
 
     async def get_user_info(self, user_id: int) -> Optional[UserInfo]:
+        """获取用户信息。"""
         result = await self.execute(
             "SELECT * FROM users WHERE user_id = $1",
-            (user_id,),
+            user_id,
             fetch="one"
         )
         return UserInfo(**result) if result else None
 
     async def get_recent_users(self) -> List[UserInfo]:
+        """获取最近验证的用户（最多3个）。"""
         results = await self.execute(
             """
             SELECT u.* FROM users u
@@ -328,6 +362,7 @@ class Database:
         return [UserInfo(**r) for r in results]
 
     async def get_blacklist(self) -> List[UserInfo]:
+        """获取黑名单用户（最多5个）。"""
         results = await self.execute(
             """
             SELECT * FROM users
@@ -339,6 +374,7 @@ class Database:
         return [UserInfo(**r) for r in results]
 
     async def get_stats(self) -> Dict:
+        """获取用户统计信息。"""
         result = await self.execute(
             """
             SELECT 
@@ -354,6 +390,7 @@ class Database:
         return dict(result)
 
     async def add_verification(self, verification: Verification):
+        """添加或更新验证记录。"""
         await self.execute(
             """
             INSERT INTO verification (
@@ -383,6 +420,7 @@ class Database:
         )
 
     async def update_verification(self, verification: Verification):
+        """更新验证记录。"""
         await self.execute(
             """
             UPDATE verification
@@ -403,61 +441,44 @@ class Database:
         )
 
     async def verify_user(self, user_id: int):
+        """标记用户为已验证。"""
         async with self.transaction():
-            try:
-                result = await self.execute(
-                    """
-                    UPDATE verification
-                    SET verified = TRUE, verification_time = $2, message_id = NULL
-                    WHERE user_id = $1
-                    RETURNING verified
-                    """,
-                    (user_id, self._normalize_datetime(datetime.datetime.now(BEIJING_TZ))),
-                    fetch="val"
-                )
-                # 检查更新是否成功
-                if result is None or result == 0:
-                    logger.error(f"Failed to verify user {user_id}: No verification record found")
-                    raise ValueError("用户验证记录不存在")
-                logger.debug(f"User {user_id} marked as verified in database")
-                # 验证更新结果
-                is_verified = await self.is_verified(user_id)
-                if not is_verified:
-                    logger.error(f"Verification state not updated for user {user_id} after verify_user")
-                    raise RuntimeError("验证状态更新失败")
-            except Exception as e:
-                logger.error(f"Error verifying user {user_id}: {str(e)}", exc_info=True)
-                raise
-
-    async def is_verified(self, user_id: int) -> bool:
-        try:
+            now = self._normalize_datetime(datetime.datetime.now(BEIJING_TZ))
             result = await self.execute(
                 """
-                SELECT verified FROM verification
+                UPDATE verification
+                SET verified = TRUE, verification_time = $2, message_id = NULL
                 WHERE user_id = $1
+                RETURNING verified
                 """,
-                (user_id,),
+                (user_id, now),
                 fetch="val"
             )
-            verified = bool(result) if result is not None else False
-            logger.debug(f"Checked verification status for user {user_id}: verified={verified}")
-            return verified
-        except Exception as e:
-            logger.error(f"Error checking verification status for user {user_id}: {str(e)}", exc_info=True)
-            return False
+            if result is None:
+                logger.error(f"验证用户 {user_id} 失败：无验证记录")
+                raise ValueError("用户验证记录不存在")
+            logger.debug(f"用户 {user_id} 已标记为已验证")
+
+    async def is_verified(self, user_id: int) -> bool:
+        """检查用户是否已验证。"""
+        result = await self.execute(
+            "SELECT verified FROM verification WHERE user_id = $1",
+            user_id,
+            fetch="val"
+        )
+        return bool(result) if result is not None else False
 
     async def get_verification(self, user_id: int) -> Optional[Verification]:
+        """获取用户验证记录。"""
         result = await self.execute(
-            """
-            SELECT * FROM verification
-            WHERE user_id = $1
-            """,
-            (user_id,),
+            "SELECT * FROM verification WHERE user_id = $1",
+            user_id,
             fetch="one"
         )
         return Verification(**result) if result else None
 
     async def update_conversation(self, user_id: int):
+        """更新用户对话时间。"""
         await self.execute(
             """
             INSERT INTO conversations (user_id, last_message_time)
@@ -469,14 +490,15 @@ class Database:
         )
 
     async def clean_database(self):
-        async with self.transaction() as conn:
-            await conn.execute("DELETE FROM users")
-            await conn.execute("DELETE FROM verification")
-            await conn.execute("DELETE FROM conversations")
+        """清除数据库所有数据。"""
+        async with self.transaction():
+            await self.execute("DELETE FROM users")
+            await self.execute("DELETE FROM verification")
+            await self.execute("DELETE FROM conversations")
             logger.info(MESSAGE_TEMPLATES["db_cleared"])
 
-    # 在Database类中添加get_verified_users方法
     async def get_verified_users(self) -> List[UserInfo]:
+        """获取所有已验证用户。"""
         results = await self.execute(
             """
             SELECT u.* FROM users u
