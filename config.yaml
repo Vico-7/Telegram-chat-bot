@@ -4,7 +4,7 @@ webhook_url: "替换为你的webhook网址"
 webhook_port: 8443
 secret_token: ""
 database:
-  database: ""  # 改为 database
+  database: ""  
   user: ""
   password: ""
   host: ""
