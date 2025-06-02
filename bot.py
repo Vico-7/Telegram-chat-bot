@@ -1,3 +1,4 @@
+__version__ = "1.0.0"
 import asyncio
 import uuid
 from typing import Optional
