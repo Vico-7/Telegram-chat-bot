@@ -57,3 +57,14 @@
 
 ### 未完待续
 更多强大功能，敬请部署后亲自体验。
+
+## 部署
+
+### 前置准备
+为确保部署顺利，请提前准备以下内容：
+- <span style="color: #e74c3c;">一台安装了 1panel 的服务器</span>：用于托管和管理机器人服务。
+- <span style="color: #e74c3c;">一个域名</span>：用于配置 Webhook 和访问服务。
+
+### 部署步骤
+请参考以下文档完成部署：
+- <span style="color: #e74c3c;">部署文档</span>：[hhh.sonnet.cv](https://hhh.sonnet.cv)
