@@ -695,8 +695,7 @@ class TelegramBot:
         verification_enabled = await self.db.get_verification_enabled()
         if not verification_enabled:
             logger.debug(f"Verification disabled, skipping verification for user {user_id}")
-            await self.db.verify_user(user_id)  # 直接标记为已验证
-            return
+            return  # 不标记用户为已验证，直接返回
 
         remaining = 3 - verification.error_count
         if remaining <= 0:
