@@ -104,7 +104,6 @@ class Database:
     async def _init_tables(self):
         """初始化数据库表结构和索引。"""
         async with self._acquire_connection() as conn:
-            # 优化：使用单一事务执行所有表创建和索引操作
             async with conn.transaction():
                 # 创建 users 表
                 await conn.execute("""
@@ -142,8 +141,14 @@ class Database:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS settings (
                         setting_key TEXT PRIMARY KEY,
-                        setting_value BOOLEAN NOT NULL
+                        setting_value BOOLEAN,
+                        verification_difficulty INTEGER
                     )
+                """)
+                # 添加缺失的列
+                await conn.execute("""
+                    ALTER TABLE settings
+                    ADD COLUMN IF NOT EXISTS verification_difficulty INTEGER
                 """)
                 # 创建索引
                 await conn.execute("""
@@ -151,23 +156,28 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_verification_verified ON verification (verified);
                     CREATE INDEX IF NOT EXISTS idx_conversations_last_message_time ON conversations (last_message_time);
                 """)
-                # 更新 schema
+                # 更新 users 表 schema
                 await conn.execute("""
                     ALTER TABLE users
                     ADD COLUMN IF NOT EXISTS block_reason TEXT,
                     ADD COLUMN IF NOT EXISTS block_time TIMESTAMP
                 """)
+                # 更新 verification 表 schema
                 await conn.execute("""
                     ALTER TABLE verification
                     ADD COLUMN IF NOT EXISTS message_id BIGINT
                 """)
-                # 初始化验证开关状态
-                await conn.execute("""
-                    INSERT INTO settings (setting_key, setting_value)
-                    VALUES ('verification_enabled', TRUE)
-                    ON CONFLICT (setting_key) DO NOTHING
-                """)
-            logger.debug(MESSAGE_TEMPLATES["db_schema_updated"])
+                # 检查 settings 表是否已有记录
+                existing_settings = await conn.fetchval("""
+                    SELECT COUNT(*) FROM settings WHERE setting_key = $1
+                """, "verification_enabled")
+                if existing_settings == 0:
+                    # 仅在 settings 表为空时插入默认值
+                    await conn.execute("""
+                        INSERT INTO settings (setting_key, setting_value, verification_difficulty)
+                        VALUES ('verification_enabled', TRUE, 2)
+                    """)
+                logger.debug(MESSAGE_TEMPLATES["db_schema_updated"])
 
     async def get_verification_enabled(self) -> bool:
         """获取人机验证开关状态，默认开启。"""
@@ -197,6 +207,37 @@ class Database:
             logger.debug(f"验证开关设置为 {enabled}")
         except Exception as e:
             logger.error(f"设置验证开关失败: {str(e)}")
+            raise
+
+    async def get_verification_difficulty(self) -> int:
+        """获取人机验证难度等级，默认简单（1）。"""
+        try:
+            result = await self.execute(
+                "SELECT verification_difficulty FROM settings WHERE setting_key = $1",
+                "verification_enabled",
+                fetch="val"
+            )
+            return result if result is not None else 1  # 默认返回简单难度
+        except Exception as e:
+            logger.error(f"获取验证难度等级失败: {str(e)}")
+            return 1  # 出错时返回默认简单难度
+
+    async def set_verification_difficulty(self, difficulty: int):
+        """设置人机验证难度等级。"""
+        if difficulty not in [1, 2, 3]:
+            raise ValueError("无效的难度等级，必须为1（简单）、2（中等）或3（困难）")
+        try:
+            await self.execute(
+                """
+                UPDATE settings
+                SET verification_difficulty = $1
+                WHERE setting_key = $2
+                """,
+                (difficulty, "verification_enabled")
+            )
+            logger.debug(f"验证难度等级设置为 {difficulty}")
+        except Exception as e:
+            logger.error(f"设置验证难度等级失败: {str(e)}")
             raise
 
     @staticmethod
