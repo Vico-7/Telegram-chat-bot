@@ -321,10 +321,10 @@ class BanHandler:
             self.bot.verification_timers[user_id].cancel()
             del self.bot.verification_timers[user_id]
             logger.debug(f"Cancelled verification timer for user {user_id}")
-
+    
         verification.error_count += 1
         remaining = 3 - verification.error_count
-
+    
         if remaining > 0:
             # 生成新题目
             question, answer, options = MathVerification.generate_question()
@@ -349,7 +349,8 @@ class BanHandler:
                 "❓ 验证题目 ❓\n"
                 f"📌 {verification.question}\n\n"
                 f"⏰ 请在 {Config.VERIFICATION_TIMEOUT // 60}分钟 内作答！\n"
-                f"🔄 剩余尝试次数：{remaining}/3"
+                f"🔄 剩余尝试次数：{remaining}/3\n\n"
+                "🌐 *了解更多*：访问我们的[开源项目](https://github.com/Vico-7/Telegram-chat-bot)"
             )
             try:
                 await self.bot.application.bot.edit_message_text(
@@ -357,7 +358,7 @@ class BanHandler:
                     message_id=verification.message_id,
                     text=question_message,
                     reply_markup=create_verification_keyboard(user_id, options),
-                    parse_mode=None
+                    parse_mode="MarkdownV2"  # 使用 MarkdownV2 解析
                 )
                 await self.db.update_verification(verification)
                 # 设置新定时器
@@ -387,7 +388,7 @@ class BanHandler:
                 logger.warning(f"Failed to edit verification failure message for user {user_id}: {str(e)}")
             except Exception as e:
                 logger.debug(f"Failed to edit verification failure message for user {user_id}: {str(e)}")
-
+    
             # 拉黑用户
             await self.ban_user(
                 user_id=user_id,
@@ -398,7 +399,7 @@ class BanHandler:
                 reason="验证失败三次",
                 admin_id=Config.ADMIN_ID  # 明确指定 admin_id
             )
-
+    
             # 发送管理员通知
             user_info = await self.db.get_user_info(user_id)
             buttons = [[InlineKeyboardButton("✅ 解除拉黑", callback_data=f"cb_unban_{user_id}")]]
@@ -696,13 +697,13 @@ class TelegramBot:
         if not verification_enabled:
             logger.debug(f"Verification disabled, skipping verification for user {user_id}")
             return  # 不标记用户为已验证，直接返回
-
+    
         remaining = 3 - verification.error_count
         if remaining <= 0:
             logger.debug(f"Max verification attempts reached for user {user_id}")
             await self.ban_handler.handle_verification_failure(user_id, verification, reason="max_attempts")
             return
-
+    
         question, answer, options = MathVerification.generate_question()
         verification.update(
             question=question,
@@ -710,10 +711,10 @@ class TelegramBot:
             options=options,
             verification_time=datetime.datetime.now(BEIJING_TZ).astimezone(pytz.UTC).replace(tzinfo=None)
         )
-
+    
         try:
             question_message = (
-                "🎉 欢迎使用我的机器人！ 🎉\n\n"
+                "🎉 *欢迎使用我的机器人！* 🎉\n\n"
                 "为了确保您是真人用户，请完成以下人机验证 🔐\n\n"
                 "📝 验证规则：\n"
                 "1️⃣ 回答数学题目，点击下方选项提交答案。\n"
@@ -722,13 +723,14 @@ class TelegramBot:
                 "❓ 验证题目 ❓\n"
                 f"📌 {verification.question}\n\n"
                 f"⏰ 请在 {Config.VERIFICATION_TIMEOUT // 60}分钟 内作答！\n"
-                f"🔄 剩余尝试次数：{remaining}/3"
+                f"🔄 剩余尝试次数：{remaining}/3\n\n"
+                "🌐 *了解更多*：访问我们的[开源项目](https://github.com/Vico-7/Telegram-chat-bot)"
             )
             msg = await self.application.bot.send_message(
                 chat_id=user_id,
                 text=question_message,
                 reply_markup=create_verification_keyboard(user_id, options),
-                parse_mode=None  # 移除 Markdown 解析
+                parse_mode="MarkdownV2"  # 使用 MarkdownV2 解析
             )
             verification.message_id = msg.message_id
             await self.db.update_verification(verification)
