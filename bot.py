@@ -1,4 +1,3 @@
-__version__ = "1.0.0"
 import asyncio
 import uuid
 from typing import Optional
@@ -140,17 +139,17 @@ class BotApplication:
         logger.info(Config.MESSAGE_TEMPLATES["shutdown_initiated"])
         try:
             # 清理 ForwardMessageHandler 状态
-            if self.forward_handler and hasattr(self.forward_handler, 'clear_chat_state'):
+            if hasattr(self, 'forward_handler') and self.forward_handler and hasattr(self.forward_handler, 'clear_chat_state'):
                 try:
                     await asyncio.wait_for(self.forward_handler.clear_chat_state(Config.ADMIN_ID), timeout=5.0)
                     logger.info("ForwardMessageHandler state cleared")
                 except Exception as e:
                     logger.error(f"Failed to clear ForwardMessageHandler state: {str(e)}", exc_info=True)
             else:
-                logger.warning(f"ForwardMessageHandler is None or lacks clear_chat_state method: forward_handler={self.forward_handler}")
+                logger.warning(f"ForwardMessageHandler is None or not initialized: forward_handler={getattr(self, 'forward_handler', None)}")
 
             # 清理 bot 状态
-            if self.bot:
+            if hasattr(self, 'bot') and self.bot:
                 try:
                     await asyncio.wait_for(self.bot.shutdown(), timeout=10.0)
                     logger.info("Bot shutdown completed")
@@ -158,7 +157,7 @@ class BotApplication:
                     logger.error(f"Failed to shutdown bot: {str(e)}", exc_info=True)
 
             # 停止 Telegram 应用
-            if self.application:
+            if hasattr(self, 'application') and self.application:
                 if self.application.updater and self.application.updater.running:
                     try:
                         await asyncio.wait_for(self.application.updater.stop(), timeout=10.0)
@@ -178,7 +177,7 @@ class BotApplication:
                         logger.error(f"Failed to shutdown application: {str(e)}", exc_info=True)
 
             # 关闭数据库连接
-            if self.db:
+            if hasattr(self, 'db') and self.db:
                 try:
                     await asyncio.wait_for(self.db.close(), timeout=10.0)
                     logger.info(Config.MESSAGE_TEMPLATES["db_closed"])
