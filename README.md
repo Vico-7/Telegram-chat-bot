@@ -76,5 +76,5 @@
 
 2. **参考部署文档**：
    - 按照以下文档完成部署：
-   - [部署文档](https://blog.sonnet.cv/2025/06/03/telegram-chat-bot)
+   - [部署文档](https://blog.gusmin.net/2025/06/03/telegram-chat-bot)
 
