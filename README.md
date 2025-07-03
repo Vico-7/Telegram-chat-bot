@@ -74,6 +74,7 @@
      | 源代码下载界面 |
      | :-------------: |
      | <img src="https://github.com/user-attachments/assets/9c1d5d48-87f4-4d83-8020-e12ef141eade" alt="源代码下载" width="300" /> |
+   - 或者在[发布页](https://github.com/Vico-7/Telegram-chat-bot/releases)直接下载压缩包
 
 2. **参考部署文档**：
    - 按照以下文档完成部署：
