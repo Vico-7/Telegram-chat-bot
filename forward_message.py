@@ -6,13 +6,15 @@ from logger import logger
 from database import Database, UserInfo
 from config import Config
 from telegram.error import Forbidden
+import time
 
 class ForwardMessageHandler:
     def __init__(self, db: Database, application):
         self.db = db
         self.application = application
-        self.current_chats: Dict[int, int] = {}
-        self.chat_timers: Dict[int, asyncio.TimerHandle] = {}
+        self.current_chats: Dict[int, int] = {}  # 管理员ID -> 目标用户ID
+        self.chat_timers: Dict[int, asyncio.TimerHandle] = {}  # 管理员ID -> 定时器句柄
+        self.last_message_time: Dict[int, float] = {}  # 管理员ID -> 最后消息发送时间戳
         self.escape_markdown_v2: Optional[Callable[[str], str]] = None
         logger.debug("ForwardMessageHandler initialized")
 
@@ -104,6 +106,11 @@ class ForwardMessageHandler:
                     message.chat_id,
                     f"消息已转发给 {user_info.nickname}"
                 )
+                # 更新最后消息时间
+                self.last_message_time[user.id] = time.time()
+                logger.debug(f"Updated last message time for admin {user.id} to {self.last_message_time[user.id]}")
+                # 重置定时器
+                await self.reset_timer(user.id, Config.CHAT_TIMEOUT, self.check_and_reset_chat)
                 logger.info(f"Message forwarded from admin {user.id} to user {target_user_id}, type: {message_type}")
             except Forbidden:
                 logger.warning(f"Cannot forward message to user {target_user_id}: User has blocked the bot")
@@ -157,10 +164,8 @@ class ForwardMessageHandler:
                          is_button: bool = False):
         admin_id = update.effective_user.id
         if admin_id != Config.ADMIN_ID:
-            if update.effective_user.id != Config.ADMIN_ID:
-                logger.debug(f"Non-admin user {admin_id} attempted to switch chat to user {user_id}")
-                return
-            admin_id = Config.ADMIN_ID
+            logger.debug(f"Non-admin user {admin_id} attempted to switch chat to user {user_id}")
+            return
 
         reply_method = await self._get_reply_method(update, context, is_button, admin_id)
 
@@ -193,16 +198,19 @@ class ForwardMessageHandler:
         logger.debug(f"Cleared pending_request and waiting_user_id for admin {admin_id} in switch_chat")
 
         self.current_chats[admin_id] = user_id
-        await self.reset_timer(admin_id, Config.CHAT_TIMEOUT, self.reset_chat)
+        # 初始化最后消息时间（切换时尚未发送消息）
+        self.last_message_time[admin_id] = 0
+        await self.reset_timer(admin_id, Config.CHAT_TIMEOUT, self.check_and_reset_chat)
         logger.debug(f"Admin {admin_id} set target to user {user_id}, current_chats: {self.current_chats}")
 
         try:
             # 计算超时分钟数
             timeout_minutes = Config.CHAT_TIMEOUT // 60
-            # 使用纯文本通知，移除 MarkdownV2 和主页跳转
+            # 使用 MarkdownV2 格式，支持点击跳转用户主页
+            escaped_nickname = self.escape_markdown_v2(user_info.nickname or "未知用户")
             await reply_method(
-                text=f"对话目标已切换为 {user_info.nickname}， {timeout_minutes} 分钟后自动重置",
-                parse_mode=None
+                text=f"对话目标已切换为 [{escaped_nickname}](tg://user?id={user_id})，将在管理员 *{timeout_minutes}* 分钟未发送消息后自动重置",
+                parse_mode="MarkdownV2"
             )
             logger.info(f"Admin {admin_id} switched to user {user_id}")
         except Exception as e:
@@ -217,15 +225,36 @@ class ForwardMessageHandler:
             self.chat_timers[admin_id].cancel()
             del self.chat_timers[admin_id]
             logger.debug(f"Cancelled chat timer for admin {admin_id}")
+        if admin_id in self.last_message_time:
+            del self.last_message_time[admin_id]
+            logger.debug(f"Removed last message time for admin {admin_id}")
 
-    async def reset_chat(self, admin_id: int):
-        if admin_id in self.current_chats:
+    async def check_and_reset_chat(self, admin_id: int):
+        if admin_id not in self.current_chats:
+            logger.debug(f"No chat target for admin {admin_id}, skipping reset")
+            return
+
+        current_time = time.time()
+        last_time = self.last_message_time.get(admin_id, 0)
+        elapsed = current_time - last_time
+
+        if last_time == 0 or elapsed >= Config.CHAT_TIMEOUT:
             target_user_id = self.current_chats[admin_id]
-            logger.info(f"Chat reset for admin {admin_id} due to timeout, target: {target_user_id}")
-            self.current_chats.pop(admin_id, None)
-        if admin_id in self.chat_timers:
-            self.chat_timers.pop(admin_id, None)
-            logger.debug(f"Removed chat timer for admin {admin_id} after reset")
+            logger.info(f"Chat reset for admin {admin_id} due to inactivity, target: {target_user_id}, elapsed: {elapsed}s")
+            await self.clear_chat_state(admin_id)
+            try:
+                await self.application.bot.send_message(
+                    chat_id=admin_id,
+                    text="由于长时间未发送消息，对话目标已自动重置",
+                    parse_mode=None
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id} of chat reset: {str(e)}")
+        else:
+            # 如果未达到冷却时间，重新设置定时器，检查剩余时间
+            remaining_time = Config.CHAT_TIMEOUT - elapsed
+            await self.reset_timer(admin_id, int(remaining_time), self.check_and_reset_chat)
+            logger.debug(f"Rescheduled timer for admin {admin_id}, remaining time: {remaining_time}s")
 
     async def reset_timer(self, admin_id: int, timeout: int, callback):
         try:
@@ -236,6 +265,6 @@ class ForwardMessageHandler:
             self.chat_timers[admin_id] = loop.call_later(
                 timeout, lambda: asyncio.create_task(callback(admin_id))
             )
-            logger.debug(f"Timer reset for admin {admin_id}, timeout: {timeout}s")
+            logger.debug(f"Timer set for admin {admin_id}, timeout: {timeout}s")
         except Exception as e:
             logger.error(f"Failed to reset timer for admin {admin_id}: {str(e)}", exc_info=True)

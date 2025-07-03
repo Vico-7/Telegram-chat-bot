@@ -138,14 +138,16 @@ class VerificationHandler:
                         return
 
                     try:
-                        # 直接设置对话目标并发送切换通知
+                        # 直接设置对话目标并初始化最后消息时间
                         self.bot.forward_handler.current_chats[admin_id] = user_id
+                        self.bot.forward_handler.last_message_time[admin_id] = 0  # 初始化为未发送消息
                         await self.bot.forward_handler.reset_timer(admin_id, Config.CHAT_TIMEOUT,
-                                                                self.bot.forward_handler.reset_chat)
-                        escaped_nickname = escape_markdown_v2(user_info.nickname or "未知用户")
+                                                                self.bot.forward_handler.check_and_reset_chat)
+                        timeout_minutes = Config.CHAT_TIMEOUT // 60
+                        escaped_nickname = self.bot.forward_handler.escape_markdown_v2(user_info.nickname or "未知用户")
                         await self.bot.application.bot.send_message(
                             chat_id=admin_id,
-                            text=f"对话目标已自动切换为“[{escaped_nickname}](tg://user?id={user_id})”",
+                            text=f"对话目标已自动切换为 [{escaped_nickname}](tg://user?id={user_id})，将在管理员 *{timeout_minutes}* 分钟未发送消息后自动重置",
                             parse_mode="MarkdownV2"
                         )
                         logger.info(f"Automatically switched admin {admin_id} chat to user {user_id}")
